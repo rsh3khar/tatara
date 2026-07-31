@@ -1,0 +1,120 @@
+schema_version = 1
+id = "qwen36-35b-a3b-affine-q4-g64"
+family = "qwen36-hybrid-moe"
+model_type = "qwen3_5_moe"
+status = "bootstrap-target"
+artifact_manifest = "artifact.toml"
+reference_contract = "reference.toml"
+
+[dimensions]
+layers = 40
+hidden = 2048
+vocabulary = 248320
+
+[attention]
+layer_period = 4
+first_layer = 3
+index_base = 0
+kv_heads = 2
+query_heads = 16
+head_dimension = 256
+
+[gated_delta]
+recurrent_heads = 32
+state_dimension = 128
+
+[moe]
+experts = 256
+active_experts = 8
+expert_dimension = 512
+
+[weights]
+format = "affine-q4"
+group_size = 64
+
+[context]
+initial_serving_capacity = 16384
+maximum_capacity = 262144
+
+[tokenizer]
+kind = "byte-level-bpe"
+data_path = "tokenizer.json"
+data_sha256 = "87a7830d63fcf43bf241c3c5242e96e62dd3fdc29224ca26fed8ea333db72de4"
+config_path = "tokenizer_config.json"
+config_sha256 = "e98f1901ac6f0adff67b1d540bfa0c36ac1a0cf59eb72ed78146ef89aafa1182"
+normalization = "nfc"
+pretokenizer = "qwen-regex-byte-level-v1"
+split_pattern = "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"
+decoder = "byte-level"
+vocabulary = 248320
+populated_vocabulary = 248077
+template_kind = "qwen36-text-v1"
+template_path = "chat_template.jinja"
+template_sha256 = "e84f32a23fdda27689f868aa4a1a5621f41133e51a48d7f3efcbea2839574259"
+end_of_text_id = 248044
+message_start_id = 248045
+message_end_id = 248046
+thinking_start_id = 248068
+thinking_end_id = 248069
+padding_id = 248044
+stop_token_ids = [248046, 248044]
+default_thinking = true
+
+# Tensor-name prefixes this package does not serve. Decode never reads the
+# vision tower of this multimodal checkpoint, so those tensors stay out of the
+# model image; the prepared record still describes the complete artifact.
+[residency]
+excluded_tensor_prefixes = ["vision_tower."]
+
+# The checkpoint's flat dotted naming scheme. Per-layer names read
+# `<model_prefix><layer_prefix><decimal index><layer_index_suffix><block
+# prefix><leaf>`. Quantized entries name a stem that the three affine-Q4
+# component suffixes complete; plain entries name the leaf exactly, because the
+# checkpoint spells some of them without a `.weight` tail. Key ORDER here is
+# free -- the generator emits in its own field order regardless. What is
+# enforced is the key SET: a missing or unknown key fails generation.
+[tensor_names]
+model_prefix = "language_model.model."
+layer_prefix = "layers."
+layer_index_suffix = "."
+
+embedding_stem = "embed_tokens"
+final_norm = "norm.weight"
+# The head sits outside the model prefix, so it carries a full stem.
+head_stem = "language_model.lm_head"
+
+input_norm = "input_layernorm.weight"
+post_norm = "post_attention_layernorm.weight"
+
+gated_delta_prefix = "linear_attn."
+gated_delta_qkv_stem = "in_proj_qkv"
+gated_delta_z_stem = "in_proj_z"
+gated_delta_b_stem = "in_proj_b"
+gated_delta_a_stem = "in_proj_a"
+gated_delta_out_stem = "out_proj"
+gated_delta_conv = "conv1d.weight"
+gated_delta_a_log = "A_log"
+gated_delta_dt_bias = "dt_bias"
+gated_delta_norm = "norm.weight"
+
+attention_prefix = "self_attn."
+attention_query_stem = "q_proj"
+attention_key_stem = "k_proj"
+attention_value_stem = "v_proj"
+attention_out_stem = "o_proj"
+attention_query_norm = "q_norm.weight"
+attention_key_norm = "k_norm.weight"
+
+mixture_prefix = "mlp."
+router_stem = "gate"
+shared_router_stem = "shared_expert_gate"
+expert_gate_stem = "switch_mlp.gate_proj"
+expert_up_stem = "switch_mlp.up_proj"
+expert_down_stem = "switch_mlp.down_proj"
+shared_gate_stem = "shared_expert.gate_proj"
+shared_up_stem = "shared_expert.up_proj"
+shared_down_stem = "shared_expert.down_proj"
+
+quantized_weight = ".weight"
+quantized_scales = ".scales"
+quantized_biases = ".biases"

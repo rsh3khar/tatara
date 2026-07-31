@@ -1,0 +1,12 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+.venv/
+build/
+build-*/
+dist/
+profiles/local/
+results/
+compile_commands.json
+*.safetensors
+*.gguf
