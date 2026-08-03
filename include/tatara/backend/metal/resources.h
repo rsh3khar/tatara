@@ -13,6 +13,7 @@ struct MetalDeviceResult;
 struct MetalCommandQueueResult;
 struct MetalEventResult;
 struct MetalBufferResult;
+struct MetalPooledBufferResult;
 struct MetalLibraryResult;
 struct MetalComputePipelineResult;
 struct MetalCommandBufferResult;
@@ -47,6 +48,8 @@ class MetalDevice {
     friend MetalCommandQueueResult create_command_queue(const MetalDevice&);
     friend MetalEventResult create_event(const MetalDevice&);
     friend MetalBufferResult create_shared_buffer(const MetalDevice&, std::uint64_t);
+    friend MetalPooledBufferResult create_striped_pool_buffer(const MetalDevice&, std::uint64_t,
+                                                              std::uint32_t);
     friend MetalLibraryResult create_library_with_source(const MetalDevice&, std::string_view);
     friend MetalComputePipelineResult create_compute_pipeline(const MetalDevice&,
                                                               const MetalFunction&);
@@ -135,6 +138,8 @@ class MetalBuffer {
     struct Storage;
 
     friend MetalBufferResult create_shared_buffer(const MetalDevice&, std::uint64_t);
+    friend MetalPooledBufferResult create_striped_pool_buffer(const MetalDevice&, std::uint64_t,
+                                                              std::uint32_t);
     friend MetalCommandError set_buffer(MetalComputePass&, const MetalBuffer&, std::uint64_t,
                                         std::uint32_t);
     friend MetalCommandError copy_buffer(MetalBlitPass&, const MetalBuffer&, std::uint64_t,
@@ -215,6 +220,20 @@ struct MetalBufferResult {
     }
 };
 
+// A tracked placement-heap buffer holding stripe_count equal stripes at
+// stripe_stride_bytes apart; windows over each stripe bind as ordinary
+// buffers while row-batched kernels bind the pool once and address rows
+// through the stride.
+struct MetalPooledBufferResult {
+    MetalResourceError error;
+    std::optional<MetalBuffer> buffer;
+    std::uint64_t stripe_stride_bytes;
+
+    explicit operator bool() const noexcept {
+        return error == MetalResourceError::None && buffer.has_value();
+    }
+};
+
 MetalDeviceResult create_system_device();
 std::uint64_t metal_device_identity(const MetalDevice& device) noexcept;
 MetalCommandQueueResult create_command_queue(const MetalDevice& device);
@@ -225,6 +244,9 @@ MetalBufferResult create_shared_buffer(const MetalDevice& device, std::uint64_t 
 // `offset` with `length` bytes. Fails typed when the buffer is not
 // heap-backed or the placement is invalid; the view's contents pointer is
 // verified against the parent before it is returned.
+MetalPooledBufferResult create_striped_pool_buffer(const MetalDevice& device,
+                                                   std::uint64_t stripe_bytes,
+                                                   std::uint32_t stripe_count);
 MetalBufferResult create_buffer_window(const MetalBuffer& buffer,
                                        std::uint64_t offset,
                                        std::uint64_t length);

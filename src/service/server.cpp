@@ -10,7 +10,9 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <chrono>
 #include <cstring>
+#include <thread>
 #include <vector>
 
 namespace tatara::service {
@@ -175,7 +177,24 @@ void Server::run() {
                     auto parsed = parse_request(connection.inbound);
                     if (parsed.state == ParseState::Complete) {
                         connection.inbound.erase(0, parsed.consumed_bytes);
-                        keep = handle(connection.descriptor, parsed.request);
+                        const Route route =
+                            resolve_route(parsed.request.method, parsed.request.target);
+                        const bool completion_route = route == Route::ChatCompletions ||
+                                                      route == Route::Completions;
+                        if (completion_route &&
+                            configuration_.service.max_concurrent_requests > 1) {
+                            // The worker owns the socket from here; the poll
+                            // loop forgets it so other connections keep
+                            // flowing while this one generates.
+                            active_workers_.fetch_add(1);
+                            std::thread(&Server::serve_on_worker, this,
+                                        connection.descriptor, parsed.request)
+                                .detach();
+                            connection.descriptor = -1;
+                            keep = false;
+                        } else {
+                            keep = handle(connection.descriptor, parsed.request);
+                        }
                     } else if (parsed.state != ParseState::Incomplete) {
                         const bool body_too_large = parsed.state == ParseState::BodyTooLarge;
                         const auto body = render_error(
@@ -192,7 +211,7 @@ void Server::run() {
 
             if (keep) {
                 survivors.push_back(std::move(connection));
-            } else {
+            } else if (connection.descriptor >= 0) {
                 ::close(connection.descriptor);
             }
         }
@@ -200,12 +219,58 @@ void Server::run() {
     }
 
     for (auto& connection : connections) {
-        ::close(connection.descriptor);
+        if (connection.descriptor >= 0) {
+            ::close(connection.descriptor);
+        }
+    }
+    while (active_workers_.load() != 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
     if (listener_ >= 0) {
         ::close(listener_);
         listener_ = -1;
     }
+}
+
+void Server::serve_on_worker(int descriptor, HttpRequest first) {
+    bool keep = handle(descriptor, first);
+    std::string inbound;
+    while (keep && !draining_.load()) {
+        pollfd waiter{descriptor, POLLIN, 0};
+        const int ready = ::poll(&waiter, 1, kPollIntervalMilliseconds);
+        if (ready < 0 && errno != EINTR) {
+            break;
+        }
+        if (ready <= 0) {
+            continue;
+        }
+        if ((waiter.revents & (POLLHUP | POLLERR)) != 0) {
+            break;
+        }
+        std::string chunk(kReadChunkBytes, '\0');
+        const auto count = ::recv(descriptor, chunk.data(), chunk.size(), 0);
+        if (count <= 0) {
+            break;
+        }
+        inbound.append(chunk.data(), static_cast<std::size_t>(count));
+        auto parsed = parse_request(inbound);
+        if (parsed.state == ParseState::Complete) {
+            inbound.erase(0, parsed.consumed_bytes);
+            keep = handle(descriptor, parsed.request);
+        } else if (parsed.state != ParseState::Incomplete) {
+            const auto body = render_error(
+                parsed.state == ParseState::BodyTooLarge
+                    ? "request body exceeds the service limit"
+                    : "malformed or unsupported request framing",
+                "invalid_request_error", parse_state_code(parsed.state));
+            write_all(descriptor,
+                      render_response(parse_state_http_status(parsed.state),
+                                      "application/json", body, false));
+            keep = false;
+        }
+    }
+    ::close(descriptor);
+    active_workers_.fetch_sub(1);
 }
 
 bool Server::handle(int descriptor, const HttpRequest& request) {

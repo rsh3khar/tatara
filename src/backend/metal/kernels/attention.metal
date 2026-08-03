@@ -112,6 +112,91 @@ kernel void attn_qk_rope(device const bfloat* projection [[buffer(0)]],
     }
 }
 
+// Row-batched attn_qk_rope over pooled KV caches: grid y is the batch row,
+// state_table carries per-row {kv element offset, context}. Keys and values
+// pools share the stripe layout so one offset serves both. Each row's
+// arithmetic is exactly attn_qk_rope's.
+kernel void attn_qk_rope_ms(device const bfloat* projection [[buffer(0)]],
+                            device const bfloat* q_weight [[buffer(1)]],
+                            device const bfloat* k_weight [[buffer(2)]],
+                            device bfloat* q_out [[buffer(3)]],
+                            device bfloat* gate_out [[buffer(4)]],
+                            device bfloat* keys_pool [[buffer(5)]],
+                            device bfloat* values_pool [[buffer(6)]],
+                            constant uint& capacity [[buffer(7)]],
+                            device const uint* state_table [[buffer(8)]],
+                            constant uint& projection_stride [[buffer(9)]],
+                            constant uint& query_stride [[buffer(10)]],
+                            uint2 head2 [[threadgroup_position_in_grid]],
+                            uint2 d2 [[thread_position_in_threadgroup]]) {
+    const uint head = head2.x;
+    const uint d = d2.x;
+    const uint row = head2.y;
+    const uint kv_offset = state_table[row * 4u];
+    const uint context = state_table[row * 4u + 1u];
+    device const bfloat* proj_row = projection + ulong(row) * ulong(projection_stride);
+    device bfloat* q_row = q_out + ulong(row) * ulong(query_stride);
+    device bfloat* gate_row = gate_out + ulong(row) * ulong(query_stride);
+    device bfloat* keys = keys_pool + kv_offset;
+    device bfloat* values = values_pool + kv_offset;
+    threadgroup float values_shared[256];
+    threadgroup float stage[32];
+    const bool is_query = head < kAttnQueryHeads;
+    const uint local_head = is_query ? head : head - kAttnQueryHeads;
+    const uint base = is_query ? head * (2u * kAttnHeadDimension)
+                               : kAttnQGateRows + local_head * kAttnHeadDimension;
+    const float x = float(proj_row[base + d]);
+    float acc = 0.0f;
+    if (d < 64u) {
+        const uint reduce_base = d * 4u;
+        for (uint j = 0; j < 4u; ++j) {
+            const float value = float(proj_row[base + reduce_base + j]);
+            acc += value * value;
+        }
+    }
+    acc = simd_sum(acc);
+    if (d < 32u) {
+        stage[d] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (d < 64u && (d & 31u) == 0u) {
+        stage[d >> 5u] = acc;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (d < 32u) {
+        const float total = simd_sum(stage[d]);
+        if (d == 0u) {
+            stage[0] = precise::rsqrt(total / float(kAttnHeadDimension) + kRmsNormEpsilon);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float inverse = stage[0];
+    const bfloat normed_b =
+        (is_query ? q_weight[d] : k_weight[d]) * static_cast<bfloat>(x * inverse);
+    values_shared[d] = float(normed_b);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float rotated = values_shared[d];
+    if (d < 64u) {
+        const uint pair = d & 31u;
+        const float theta =
+            float(context) / pow(kAttnRopeBase, float(pair) / float(kAttnRopePairs));
+        const float cosine = cos(theta);
+        const float sine = sin(theta);
+        rotated = d < 32u ? values_shared[d] * cosine - values_shared[d + 32u] * sine
+                          : values_shared[d] * cosine + values_shared[d - 32u] * sine;
+    }
+    if (is_query) {
+        q_row[head * kAttnHeadDimension + d] = static_cast<bfloat>(rotated);
+        gate_row[head * kAttnHeadDimension + d] =
+            proj_row[head * (2u * kAttnHeadDimension) + kAttnHeadDimension + d];
+    } else {
+        keys[(local_head * capacity + context) * kAttnHeadDimension + d] =
+            static_cast<bfloat>(rotated);
+        values[(local_head * capacity + context) * kAttnHeadDimension + d] =
+            proj_row[kAttnVRowOffset + local_head * kAttnHeadDimension + d];
+    }
+}
+
 kernel void
 attention_decode(device const bfloat* q [[buffer(0)]], device const bfloat* gate [[buffer(1)]],
                  device const bfloat* keys [[buffer(2)]], device const bfloat* values [[buffer(3)]],
@@ -188,6 +273,101 @@ attention_decode(device const bfloat* q [[buffer(0)]], device const bfloat* gate
     const float g = float(gate[head * kAttnHeadDimension + tid]);
     value *= 1.0f / (1.0f + exp(-g));
     out[head * kAttnHeadDimension + tid] = static_cast<bfloat>(value);
+}
+
+// Bucket-batched attention_decode over pooled KV: grid y walks a host-built
+// row list of the streams whose solo path is the single-kernel family, so
+// no row ever changes kernel family versus its solo run. Per-row context
+// and KV offsets come from the layer's state table. Each row's arithmetic
+// is exactly attention_decode's.
+kernel void
+attention_decode_ms(device const bfloat* q [[buffer(0)]],
+                    device const bfloat* gate [[buffer(1)]],
+                    device const bfloat* keys_pool [[buffer(2)]],
+                    device const bfloat* values_pool [[buffer(3)]],
+                    device const uint* state_table [[buffer(4)]],
+                    device bfloat* out [[buffer(5)]],
+                    constant uint& capacity [[buffer(6)]],
+                    device const uint* bucket_rows [[buffer(7)]],
+                    constant uint& query_stride [[buffer(8)]],
+                    uint2 head2 [[threadgroup_position_in_grid]],
+                    uint2 tid2 [[thread_position_in_threadgroup]],
+                    uint lane [[thread_index_in_simdgroup]]) {
+    const uint head = head2.x;
+    const uint tid = tid2.x;
+    const uint row = bucket_rows[head2.y];
+    const uint kv_offset = state_table[row * 4u];
+    const uint context = state_table[row * 4u + 1u];
+    device const bfloat* q_row = q + ulong(row) * ulong(query_stride);
+    device const bfloat* gate_row = gate + ulong(row) * ulong(query_stride);
+    device const bfloat* keys = keys_pool + kv_offset;
+    device const bfloat* values = values_pool + kv_offset;
+    device bfloat* out_row = out + ulong(row) * ulong(query_stride);
+    threadgroup float scores[256];
+    threadgroup float red[256];
+    threadgroup float carry[2];
+    const uint sg = tid >> 5u;
+    const uint n = context + 1u;
+    const uint kv = head >> 3u;
+    if (tid == 0u) {
+        carry[0] = -INFINITY;
+        carry[1] = 0.0f;
+    }
+    float acc = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint tile = 0; tile < n; tile += 256u) {
+        const uint count = min(n - tile, 256u);
+        for (uint t = sg; t < count; t += 8u) {
+            float dot = 0.0f;
+            for (uint d = lane; d < kAttnHeadDimension; d += 32u) {
+                dot += float(q_row[head * kAttnHeadDimension + d]) *
+                       float(keys[(kv * capacity + tile + t) * kAttnHeadDimension + d]);
+            }
+            dot = simd_sum(dot);
+            if (lane == 0u) {
+                scores[t] = dot * kAttnScale;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        red[tid] = tid < count ? scores[tid] : -INFINITY;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint off = 128u; off; off >>= 1u) {
+            if (tid < off) {
+                red[tid] = max(red[tid], red[tid + off]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        const float previous_max = carry[0];
+        const float new_max = max(previous_max, red[0]);
+        const float rescale = previous_max == -INFINITY ? 0.0f : exp(previous_max - new_max);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        red[tid] = tid < count ? exp(scores[tid] - new_max) : 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid < count) {
+            scores[tid] = red[tid];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint off = 128u; off; off >>= 1u) {
+            if (tid < off) {
+                red[tid] += red[tid + off];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        const float tile_sum = red[0];
+        acc *= rescale;
+        for (uint t = 0; t < count; ++t) {
+            acc += scores[t] * float(values[(kv * capacity + tile + t) * kAttnHeadDimension + tid]);
+        }
+        if (tid == 0u) {
+            carry[1] = carry[1] * rescale + tile_sum;
+            carry[0] = new_max;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float value = acc / carry[1];
+    const float g = float(gate_row[head * kAttnHeadDimension + tid]);
+    value *= 1.0f / (1.0f + exp(-g));
+    out_row[head * kAttnHeadDimension + tid] = static_cast<bfloat>(value);
 }
 
 kernel void attention_decode_scores_gqa4(
@@ -925,4 +1105,115 @@ kernel void attention_decode_combine(device const float* partials [[buffer(0)]],
     const float g = float(gate[head * kAttnHeadDimension + tid]);
     value *= 1.0f / (1.0f + exp(-g));
     out[head * kAttnHeadDimension + tid] = static_cast<bfloat>(value);
+}
+
+kernel void
+attn_project_ms(device const bfloat* input [[buffer(0)]], device const uint* qg_words [[buffer(1)]],
+                device const bfloat* qg_scales [[buffer(2)]],
+                device const bfloat* qg_biases [[buffer(3)]],
+                device const uint* k_words [[buffer(4)]],
+                device const bfloat* k_scales [[buffer(5)]],
+                device const bfloat* k_biases [[buffer(6)]],
+                device const uint* v_words [[buffer(7)]],
+                device const bfloat* v_scales [[buffer(8)]],
+                device const bfloat* v_biases [[buffer(9)]],
+                device bfloat* projection [[buffer(10)]],
+                constant uint& row_count [[buffer(11)]],
+                constant uint& row_tile [[buffer(12)]],
+                uint2 tid2 [[thread_position_in_grid]],
+                uint lane [[thread_index_in_simdgroup]]) {
+    const uint row = tid2.x >> 5u;
+    const uint row_base = tid2.y * row_tile;
+    if (row >= kAttnProjectionRows || row_base >= row_count) {
+        return;
+    }
+    const uint tile_rows = min(row_tile, row_count - row_base);
+    device const uint* words;
+    device const bfloat* scales;
+    device const bfloat* biases;
+    uint local_row;
+    if (row < kAttnQGateRows) {
+        words = qg_words;
+        scales = qg_scales;
+        biases = qg_biases;
+        local_row = row;
+    } else if (row < kAttnVRowOffset) {
+        words = k_words;
+        scales = k_scales;
+        biases = k_biases;
+        local_row = row - kAttnQGateRows;
+    } else {
+        words = v_words;
+        scales = v_scales;
+        biases = v_biases;
+        local_row = row - kAttnVRowOffset;
+    }
+    const ulong word_row = ulong(local_row) * ulong(kQuantWordsPerRow);
+    const ulong group_row = ulong(local_row) * ulong(kGroupsPerRow);
+    float batch[kQ4BatchRowsMax];
+    q4_dot_ms(input + ulong(row_base) * ulong(kHiddenDimension), ulong(kHiddenDimension),
+              tile_rows, words + word_row, scales + group_row, biases + group_row,
+              kHiddenDimension, lane, batch);
+    if (lane == 0u) {
+        for (uint r = 0u; r < tile_rows; ++r) {
+            projection[ulong(row_base + r) * ulong(kAttnProjectionRows) + row] =
+                static_cast<bfloat>(batch[r]);
+        }
+    }
+}
+
+
+kernel void
+attn_project_ms_v2(device const bfloat* input [[buffer(0)]], device const uint* qg_words [[buffer(1)]],
+                device const bfloat* qg_scales [[buffer(2)]],
+                device const bfloat* qg_biases [[buffer(3)]],
+                device const uint* k_words [[buffer(4)]],
+                device const bfloat* k_scales [[buffer(5)]],
+                device const bfloat* k_biases [[buffer(6)]],
+                device const uint* v_words [[buffer(7)]],
+                device const bfloat* v_scales [[buffer(8)]],
+                device const bfloat* v_biases [[buffer(9)]],
+                device bfloat* projection [[buffer(10)]],
+                constant uint& row_count [[buffer(11)]],
+                constant uint& row_tile [[buffer(12)]],
+                uint2 tid2 [[thread_position_in_grid]],
+                uint lane [[thread_index_in_simdgroup]]) {
+    const uint row = tid2.x >> 5u;
+    const uint row_base = tid2.y * row_tile;
+    if (row >= kAttnProjectionRows || row_base >= row_count) {
+        return;
+    }
+    const uint tile_rows = min(row_tile, row_count - row_base);
+    device const uint* words;
+    device const bfloat* scales;
+    device const bfloat* biases;
+    uint local_row;
+    if (row < kAttnQGateRows) {
+        words = qg_words;
+        scales = qg_scales;
+        biases = qg_biases;
+        local_row = row;
+    } else if (row < kAttnVRowOffset) {
+        words = k_words;
+        scales = k_scales;
+        biases = k_biases;
+        local_row = row - kAttnQGateRows;
+    } else {
+        words = v_words;
+        scales = v_scales;
+        biases = v_biases;
+        local_row = row - kAttnVRowOffset;
+    }
+    const ulong word_row = ulong(local_row) * ulong(kQuantWordsPerRow);
+    const ulong group_row = ulong(local_row) * ulong(kGroupsPerRow);
+    float batch[kQ4BatchRowsMax];
+    q4_dot_ms_v2(input + ulong(row_base) * ulong(kHiddenDimension), ulong(kHiddenDimension),
+              tile_rows, words + word_row, scales + group_row, biases + group_row,
+              kHiddenDimension, lane, batch);
+    if (lane == 0u) {
+        for (uint r = 0u; r < tile_rows; ++r) {
+            projection[ulong(row_base + r) * ulong(kAttnProjectionRows) + row] =
+                static_cast<bfloat>(batch[r]);
+        }
+    }
 }

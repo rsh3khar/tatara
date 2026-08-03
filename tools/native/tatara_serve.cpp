@@ -28,6 +28,8 @@
 #include "tatara/text/tokenizer.h"
 #include "tatara/version.h"
 
+#include <pthread.h>
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -36,9 +38,16 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <deque>
 #include <iostream>
 #include <limits>
+#include <memory>
+#include <mutex>
 #include <span>
+#include <thread>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -741,7 +750,8 @@ bool nonfatal_cache_reservation_error(PrefixCacheError error) noexcept {
     return false;
 }
 
-bool execute_state_slot_reset(DecodeHarness& harness) {
+bool execute_state_slot_reset_on(DecodeHarness& harness,
+                                 DecodeStateSlot& slot) {
     auto command_buffer = create_command_buffer(*harness.queue);
     if (!command_buffer) {
         return false;
@@ -751,7 +761,7 @@ bool execute_state_slot_reset(DecodeHarness& harness) {
         return false;
     }
     StateSlotResetResult encoded =
-        encode_state_slot_reset(*harness.step, harness.step->state,
+        encode_state_slot_reset(*harness.step, slot,
                                 *pass.blit_pass);
     if (!encoded) {
         return false;
@@ -760,7 +770,7 @@ bool execute_state_slot_reset(DecodeHarness& harness) {
     if (!ended) {
         if (encoded.ticket) {
             (void)abort_state_slot_reset(*encoded.ticket, *harness.step,
-                                         harness.step->state);
+                                         slot);
         }
         return false;
     }
@@ -770,7 +780,7 @@ bool execute_state_slot_reset(DecodeHarness& harness) {
     auto pending = commit(std::move(*ended.command_buffer));
     if (!pending) {
         (void)abort_state_slot_reset(*encoded.ticket, *harness.step,
-                                     harness.step->state);
+                                     slot);
         return false;
     }
     const MetalExecutionResult execution =
@@ -779,13 +789,17 @@ bool execute_state_slot_reset(DecodeHarness& harness) {
         if (execution.state == MetalExecutionState::Completed ||
             execution.state == MetalExecutionState::Error) {
             (void)abort_state_slot_reset(*encoded.ticket, *harness.step,
-                                         harness.step->state);
+                                         slot);
         }
         return false;
     }
     return complete_state_slot_reset(*encoded.ticket, *harness.step,
-                                     harness.step->state) ==
+                                     slot) ==
            StateSlotResetError::None;
+}
+
+bool execute_state_slot_reset(DecodeHarness& harness) {
+    return execute_state_slot_reset_on(harness, harness.step->state);
 }
 
 bool execute_prefix_restore(
@@ -1152,14 +1166,654 @@ bool boot_prefix_cache(
     return true;
 }
 
+// The multi-stream engine owner. One thread owns every piece of Metal
+// state; workers submit prompts and consume token channels. Each lane is
+// a state slot plus a stream scratch.
+
+enum class LaneDoneReason : std::uint8_t { Stopped, Length, Cancelled, Failed };
+
+struct LaneChannel {
+    std::mutex mutex;
+    std::condition_variable ready;
+    std::deque<std::uint32_t> tokens;
+    bool done{false};
+    LaneDoneReason reason{LaneDoneReason::Failed};
+};
+
+struct OwnerSubmission {
+    std::vector<std::uint32_t> prompt;
+    std::vector<std::uint32_t> stop_ids;
+    std::uint32_t maximum_tokens{0};
+    std::shared_ptr<LaneChannel> channel;
+    std::shared_ptr<std::atomic<bool>> cancelled;
+};
+
+// One pool group: up to eight lanes striped over shared state pools with
+// their own batch scratch.
+struct OwnerLaneGroup {
+    DecodeStatePool pool;
+    std::vector<DecodeStateSlot> slots;
+    DecodeBatchScratch batch_scratch;
+};
+
+class MultiStreamOwner {
+  public:
+    MultiStreamOwner(DecodeHarness& harness,
+                     std::vector<PrefillStep*> join_prefills,
+                     std::vector<OwnerLaneGroup> groups,
+                     std::vector<DecodeStreamScratch> scratches,
+                     DecodeBatchPipelines batch_kernels,
+                     std::uint32_t queue_depth)
+        : harness_(harness),
+
+          groups_(std::move(groups)),
+          scratches_(std::move(scratches)),
+          batch_kernels_(std::move(batch_kernels)),
+          bound_(queue_depth) {
+        std::size_t scratch_index = 0;
+        for (std::size_t g = 0; g < groups_.size(); ++g) {
+            for (std::size_t s = 0; s < groups_[g].slots.size(); ++s) {
+                Lane lane;
+                lane.slot = &groups_[g].slots[s];
+                lane.scratch = scratch_index < scratches_.size()
+                                   ? &scratches_[scratch_index]
+                                   : nullptr;
+                ++scratch_index;
+                lane.stripe = static_cast<std::uint32_t>(s);
+                lane.group = static_cast<std::uint32_t>(g);
+                lanes_.push_back(std::move(lane));
+            }
+        }
+        bound_ += static_cast<std::uint32_t>(lanes_.size());
+        for (PrefillStep* prefill : join_prefills) {
+            joining_.push_back(JoiningLane{nullptr, 0, prefill});
+        }
+        wave_.reserve(lanes_.size());
+        plans_.resize(groups_.size());
+        for (std::vector<Lane*>& plan : plans_) {
+            plan.reserve(lanes_.size());
+        }
+        streams_.reserve(lanes_.size());
+        join_executions_.reserve(joining_.size());
+        batch_pending_.reserve(groups_.size());
+        single_pending_.reserve(lanes_.size());
+        thread_ = std::thread(&MultiStreamOwner::run, this);
+    }
+
+    ~MultiStreamOwner() {
+        stop();
+    }
+
+    std::uint32_t lane_count() const {
+        return static_cast<std::uint32_t>(lanes_.size());
+    }
+
+    bool submit(OwnerSubmission submission) {
+        {
+            std::lock_guard<std::mutex> guard(queue_mutex_);
+            if (!running_ || outstanding_ >= bound_) {
+                return false;
+            }
+            ++outstanding_;
+            queue_.push_back(std::move(submission));
+        }
+        queue_ready_.notify_one();
+        return true;
+    }
+
+    void stop() {
+        {
+            std::lock_guard<std::mutex> guard(queue_mutex_);
+            if (!running_) {
+                return;
+            }
+            running_ = false;
+        }
+        queue_ready_.notify_all();
+        if (thread_.joinable()) {
+            thread_.join();
+        }
+        if (wave_count_ > 0) {
+            std::fprintf(
+                stderr,
+                "serve: owner waves=%llu mean=%.2f ms mean_rows=%.2f"
+                " max_rows=%zu full_waves=%llu full_mean=%.2f ms\n",
+                static_cast<unsigned long long>(wave_count_),
+                wave_ms_total_ / double(wave_count_),
+                double(wave_rows_total_) / double(wave_count_),
+                wave_rows_max_,
+                static_cast<unsigned long long>(full_wave_count_),
+                full_wave_count_ > 0
+                    ? full_wave_ms_total_ / double(full_wave_count_)
+                    : 0.0);
+        }
+    }
+
+  private:
+    struct Lane {
+        DecodeStateSlot* slot;
+        DecodeStreamScratch* scratch;
+        std::uint32_t stripe{0};
+        std::uint32_t group{0};
+        bool dirty{false};
+        bool active{false};
+        OwnerSubmission request;
+        std::uint32_t context{0};
+        std::uint32_t pending_input{0};
+        std::uint64_t produced{0};
+    };
+
+    void finish(Lane& lane, LaneDoneReason reason) {
+        {
+            std::lock_guard<std::mutex> guard(lane.request.channel->mutex);
+            lane.request.channel->done = true;
+            lane.request.channel->reason = reason;
+        }
+        lane.request.channel->ready.notify_all();
+        lane.request = OwnerSubmission{};
+        lane.active = false;
+        lane.dirty = true;
+        {
+            std::lock_guard<std::mutex> guard(queue_mutex_);
+            --outstanding_;
+        }
+    }
+
+    void push_token(Lane& lane, std::uint32_t token) {
+        {
+            std::lock_guard<std::mutex> guard(lane.request.channel->mutex);
+            lane.request.channel->tokens.push_back(token);
+        }
+        lane.request.channel->ready.notify_all();
+    }
+
+    // Joins are asynchronous: the owner advances a joining prompt one
+    // unit submission per wave, alongside the decode command buffers, so
+    // generation never stalls behind it.
+    struct BatchPending {
+        MetalPendingExecution execution;
+        std::vector<Lane*> lanes;
+        std::uint32_t group;
+    };
+    struct SinglePending {
+        Lane* lane;
+        MetalPendingExecution execution;
+    };
+
+    struct JoiningLane {
+        Lane* lane{nullptr};
+        std::uint32_t head{0};
+        PrefillStep* prefill{nullptr};
+    };
+
+    bool begin_join(Lane& lane, OwnerSubmission submission) {
+        lane.request = std::move(submission);
+        if (lane.dirty &&
+            !execute_state_slot_reset_on(harness_, *lane.slot)) {
+            finish(lane, LaneDoneReason::Failed);
+            return false;
+        }
+        lane.dirty = false;
+        const std::vector<std::uint32_t>& prompt = lane.request.prompt;
+        const std::uint32_t head =
+            static_cast<std::uint32_t>(prompt.size()) - 1u;
+        if (head == 0) {
+            lane.context = 0;
+            lane.pending_input = prompt.back();
+            lane.produced = 0;
+            lane.active = true;
+            return true;
+        }
+        JoiningLane* stream = nullptr;
+        for (JoiningLane& candidate : joining_) {
+            if (candidate.lane == nullptr) {
+                stream = &candidate;
+                break;
+            }
+        }
+        if (stream == nullptr) {
+            return false;
+        }
+        const auto begun = begin_prefill_progress(
+            *stream->prefill, *harness_.step, *lane.slot, 0, 0,
+            std::span<const std::uint32_t>(prompt.data(), head));
+        if (!begun) {
+            finish(lane, LaneDoneReason::Failed);
+            return false;
+        }
+        stream->lane = &lane;
+        stream->head = head;
+        return true;
+    }
+
+    // Encodes and commits one unit submission of the in-flight join.
+    // Returns the pending execution to be waited with the wave.
+    std::optional<MetalPendingExecution>
+    submit_join_units(JoiningLane& stream) {
+        if (stream.lane == nullptr) {
+            return std::nullopt;
+        }
+        Lane& lane = *stream.lane;
+        if (lane.request.cancelled->load()) {
+            // Abandoning a join mid-flight must release the progress
+            // machine, or the next joiner on this stream begins against
+            // a live one and fails. The lane is marked dirty by finish(),
+            // so its slot is reset before reuse (the release contract).
+            (void)release_prefill_progress(*stream.prefill, *harness_.step,
+                                           *lane.slot);
+            finish(lane, LaneDoneReason::Cancelled);
+            stream.lane = nullptr;
+            return std::nullopt;
+        }
+        const auto abandon = [&]() -> std::optional<MetalPendingExecution> {
+            (void)release_prefill_progress(*stream.prefill, *harness_.step,
+                                           *lane.slot);
+            finish(lane, LaneDoneReason::Failed);
+            stream.lane = nullptr;
+            return std::nullopt;
+        };
+        auto command_buffer = create_command_buffer(*harness_.queue);
+        if (!command_buffer) {
+            return abandon();
+        }
+        auto pass = begin_compute_pass(
+            std::move(*command_buffer.command_buffer));
+        if (!pass) {
+            return abandon();
+        }
+        if (!encode_prefill_units(*stream.prefill, *harness_.step,
+                                  *lane.slot, *pass.compute_pass)) {
+            return abandon();
+        }
+        auto ended = end_compute_pass(std::move(*pass.compute_pass));
+        auto committed = ended
+                             ? commit(std::move(*ended.command_buffer))
+                             : MetalPendingExecutionResult{};
+        if (!committed) {
+            return abandon();
+        }
+        return std::move(*committed.pending_execution);
+    }
+
+    // Called after the join submission completed: advances the unit state
+    // machine and activates the lane when the prompt head is fully placed.
+    void settle_join_units(JoiningLane& stream) {
+        if (stream.lane == nullptr) {
+            return;
+        }
+        Lane& lane = *stream.lane;
+        if (!commit_prefill_units(*stream.prefill, *harness_.step,
+                                  *lane.slot)) {
+            (void)release_prefill_progress(*stream.prefill, *harness_.step,
+                                           *lane.slot);
+            finish(lane, LaneDoneReason::Failed);
+            stream.lane = nullptr;
+            return;
+        }
+        if (stream.prefill->progress.state ==
+            PrefillProgressState::Complete) {
+            lane.context = stream.head;
+            lane.pending_input = lane.request.prompt.back();
+            lane.produced = 0;
+            lane.active = true;
+            stream.lane = nullptr;
+        }
+    }
+
+    void run() {
+        // The owner thread is the engine's critical path: every stream's
+        // next token waits on it. Worker threads wake per token to write
+        // responses, so without a QoS floor the owner is descheduled
+        // behind them under load and the GPU idles between waves.
+        pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+        DecodeStep& step = *harness_.step;
+        while (true) {
+            // Admit joiners while join streams are available.
+            while (true) {
+                bool stream_free = false;
+                for (const JoiningLane& stream : joining_) {
+                    stream_free = stream_free || stream.lane == nullptr;
+                }
+                if (!stream_free) {
+                    break;
+                }
+                OwnerSubmission next;
+                Lane* free_lane = nullptr;
+                {
+                    std::lock_guard<std::mutex> guard(queue_mutex_);
+                    if (queue_.empty()) {
+                        break;
+                    }
+                    // Prefer a free lane in a group with no join in
+                    // flight: joins in distinct groups touch distinct
+                    // pool buffers and overlap on the GPU; same-group
+                    // joins serialize on the pool's hazard domain.
+                    Lane* fallback = nullptr;
+                    for (Lane& lane : lanes_) {
+                        bool lane_joining = false;
+                        bool group_joining = false;
+                        for (const JoiningLane& stream : joining_) {
+                            lane_joining =
+                                lane_joining || stream.lane == &lane;
+                            group_joining =
+                                group_joining ||
+                                (stream.lane != nullptr &&
+                                 stream.lane->group == lane.group);
+                        }
+                        if (lane.active || lane_joining) {
+                            continue;
+                        }
+                        if (!group_joining) {
+                            free_lane = &lane;
+                            break;
+                        }
+                        if (fallback == nullptr) {
+                            fallback = &lane;
+                        }
+                    }
+                    if (free_lane == nullptr) {
+                        free_lane = fallback;
+                    }
+                    if (free_lane == nullptr) {
+                        break;
+                    }
+                    next = std::move(queue_.front());
+                    queue_.pop_front();
+                }
+                (void)begin_join(*free_lane, std::move(next));
+            }
+            join_executions_.clear();
+            for (JoiningLane& stream : joining_) {
+                join_executions_.push_back(submit_join_units(stream));
+            }
+
+            // One batched command buffer when several lanes generate
+            // together, per-lane command buffers otherwise; both paths
+            // are byte-exact per stream.
+            const auto wave_start = std::chrono::steady_clock::now();
+            wave_.clear();
+            std::vector<Lane*>& wave = wave_;
+            for (Lane& lane : lanes_) {
+                if (!lane.active) {
+                    continue;
+                }
+                if (lane.request.cancelled->load()) {
+                    finish(lane, LaneDoneReason::Cancelled);
+                    continue;
+                }
+                wave.push_back(&lane);
+            }
+            const auto settle = [&](Lane& lane, std::uint32_t token) {
+                advance_decode_state(step, *lane.slot);
+                ++lane.context;
+                ++lane.produced;
+                push_token(lane, token);
+                const bool stop_hit =
+                    std::find(lane.request.stop_ids.begin(),
+                              lane.request.stop_ids.end(),
+                              token) != lane.request.stop_ids.end();
+                if (stop_hit) {
+                    finish(lane, LaneDoneReason::Stopped);
+                } else if (lane.produced >=
+                           lane.request.maximum_tokens) {
+                    finish(lane, LaneDoneReason::Length);
+                } else {
+                    lane.pending_input = token;
+                }
+            };
+            for (std::vector<Lane*>& plan : plans_) {
+                plan.clear();
+            }
+            std::vector<std::vector<Lane*>>& plans = plans_;
+            for (Lane* lane : wave) {
+                plans[lane->group].push_back(lane);
+            }
+            batch_pending_.clear();
+            single_pending_.clear();
+            std::vector<BatchPending>& batch_pending = batch_pending_;
+            std::vector<SinglePending>& single_pending = single_pending_;
+            const std::uint64_t id_bytes = step.geometry.token_id_bytes;
+            for (std::size_t g = 0; g < plans.size(); ++g) {
+                std::vector<Lane*>& group_lanes = plans[g];
+                if (group_lanes.empty()) {
+                    continue;
+                }
+                OwnerLaneGroup& group = groups_[g];
+                if (group_lanes.size() >= 2 &&
+                    group_lanes.size() <= group.batch_scratch.rows) {
+                    streams_.clear();
+                    std::vector<DecodeStream>& streams = streams_;
+                    for (std::size_t row = 0; row < group_lanes.size();
+                         ++row) {
+                        Lane& lane = *group_lanes[row];
+                        std::memcpy(
+                            static_cast<std::uint8_t*>(
+                                group.batch_scratch.slabs.token_id
+                                    .contents()) +
+                                row * id_bytes,
+                            &lane.pending_input, 4);
+                        streams.push_back({lane.slot, nullptr,
+                                           lane.context, lane.stripe});
+                    }
+                    const auto fail_group = [&] {
+                        for (Lane* lane : group_lanes) {
+                            finish(*lane, LaneDoneReason::Failed);
+                        }
+                    };
+                    auto command_buffer =
+                        create_command_buffer(*harness_.queue);
+                    if (!command_buffer) {
+                        fail_group();
+                        continue;
+                    }
+                    auto pass = begin_compute_pass(
+                        std::move(*command_buffer.command_buffer));
+                    if (!pass) {
+                        fail_group();
+                        continue;
+                    }
+                    if (encode_token_batch(step, streams, group.pool,
+                                           group.batch_scratch,
+                                           batch_kernels_,
+                                           *pass.compute_pass) !=
+                        MetalCommandError::None) {
+                        fail_group();
+                        continue;
+                    }
+                    auto ended =
+                        end_compute_pass(std::move(*pass.compute_pass));
+                    auto committed =
+                        ended ? commit(std::move(*ended.command_buffer))
+                              : MetalPendingExecutionResult{};
+                    if (!committed) {
+                        fail_group();
+                        continue;
+                    }
+                    batch_pending.push_back(BatchPending{
+                        std::move(*committed.pending_execution),
+                        group_lanes,
+                        static_cast<std::uint32_t>(g)});
+                } else {
+                    for (Lane* entry : group_lanes) {
+                        Lane& lane = *entry;
+                        MetalBuffer& id_buffer =
+                            lane.scratch == nullptr
+                                ? step.token_id
+                                : lane.scratch->token_id;
+                        std::memcpy(id_buffer.contents(),
+                                    &lane.pending_input, 4);
+                        auto command_buffer =
+                            create_command_buffer(*harness_.queue);
+                        if (!command_buffer) {
+                            finish(lane, LaneDoneReason::Failed);
+                            continue;
+                        }
+                        auto pass = begin_compute_pass(
+                            std::move(*command_buffer.command_buffer));
+                        if (!pass) {
+                            finish(lane, LaneDoneReason::Failed);
+                            continue;
+                        }
+                        const DecodeStream one[]{
+                            {lane.slot, lane.scratch, lane.context}};
+                        if (encode_token_group(step, one,
+                                               *pass.compute_pass) !=
+                            MetalCommandError::None) {
+                            finish(lane, LaneDoneReason::Failed);
+                            continue;
+                        }
+                        auto ended = end_compute_pass(
+                            std::move(*pass.compute_pass));
+                        auto committed =
+                            ended
+                                ? commit(std::move(*ended.command_buffer))
+                                : MetalPendingExecutionResult{};
+                        if (!committed) {
+                            finish(lane, LaneDoneReason::Failed);
+                            continue;
+                        }
+                        single_pending.push_back(SinglePending{
+                            &lane,
+                            std::move(*committed.pending_execution)});
+                    }
+                }
+            }
+            for (std::size_t s = 0; s < joining_.size(); ++s) {
+                if (!join_executions_[s].has_value()) {
+                    continue;
+                }
+                if (!wait_until_completed(
+                        std::move(*join_executions_[s]))) {
+                    if (joining_[s].lane != nullptr) {
+                        (void)release_prefill_progress(
+                            *joining_[s].prefill, *harness_.step,
+                            *joining_[s].lane->slot);
+                        finish(*joining_[s].lane, LaneDoneReason::Failed);
+                        joining_[s].lane = nullptr;
+                    }
+                } else {
+                    settle_join_units(joining_[s]);
+                }
+            }
+            for (BatchPending& entry : batch_pending) {
+                if (!wait_until_completed(std::move(entry.execution))) {
+                    for (Lane* lane : entry.lanes) {
+                        finish(*lane, LaneDoneReason::Failed);
+                    }
+                    continue;
+                }
+                OwnerLaneGroup& group = groups_[entry.group];
+                for (std::size_t row = 0; row < entry.lanes.size();
+                     ++row) {
+                    std::uint32_t token = 0;
+                    std::memcpy(
+                        &token,
+                        static_cast<const std::uint8_t*>(
+                            group.batch_scratch.slabs.token_id
+                                .contents()) +
+                            row * id_bytes,
+                        4);
+                    settle(*entry.lanes[row], token);
+                }
+            }
+            for (SinglePending& entry : single_pending) {
+                if (!wait_until_completed(std::move(entry.execution))) {
+                    finish(*entry.lane, LaneDoneReason::Failed);
+                    continue;
+                }
+                Lane& lane = *entry.lane;
+                MetalBuffer& id_buffer = lane.scratch == nullptr
+                                             ? step.token_id
+                                             : lane.scratch->token_id;
+                std::uint32_t token = 0;
+                std::memcpy(&token, id_buffer.contents(), 4);
+                settle(lane, token);
+            }
+
+            {
+                const double wave_ms =
+                    std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - wave_start)
+                        .count();
+                const std::size_t rows = wave.size();
+                if (rows > 0) {
+                    wave_count_ += 1;
+                    wave_ms_total_ += wave_ms;
+                    wave_rows_total_ += rows;
+                    if (rows > wave_rows_max_) {
+                        wave_rows_max_ = rows;
+                    }
+                    if (rows == wave_rows_max_) {
+                        full_wave_count_ += 1;
+                        full_wave_ms_total_ += wave_ms;
+                    }
+                }
+            }
+            // Idle or exit.
+            std::unique_lock<std::mutex> guard(queue_mutex_);
+            const bool any_active = [&] {
+                for (const Lane& lane : lanes_) {
+                    if (lane.active) {
+                        return true;
+                    }
+                }
+                return false;
+            }();
+            bool any_joining = false;
+            for (const JoiningLane& stream : joining_) {
+                any_joining = any_joining || stream.lane != nullptr;
+            }
+            if (!running_ && queue_.empty() && !any_active &&
+                !any_joining) {
+                return;
+            }
+            if (!any_active && queue_.empty() && !any_joining) {
+                queue_ready_.wait_for(
+                    guard, std::chrono::milliseconds(5), [&] {
+                        return !queue_.empty() || !running_;
+                    });
+            }
+        }
+    }
+
+    DecodeHarness& harness_;
+    std::vector<OwnerLaneGroup> groups_;
+    std::vector<DecodeStreamScratch> scratches_;
+    DecodeBatchPipelines batch_kernels_;
+    std::vector<Lane> lanes_;
+    std::vector<JoiningLane> joining_;
+    // Wave working sets: allocated once at construction, cleared and
+    // refilled each wave. A decode wave must not touch the allocator.
+    std::vector<Lane*> wave_;
+    std::vector<std::vector<Lane*>> plans_;
+    std::vector<DecodeStream> streams_;
+    std::vector<std::optional<MetalPendingExecution>> join_executions_;
+    std::vector<BatchPending> batch_pending_;
+    std::vector<SinglePending> single_pending_;
+    std::uint64_t wave_count_{0};
+    std::uint64_t full_wave_count_{0};
+    double wave_ms_total_{0.0};
+    double full_wave_ms_total_{0.0};
+    std::size_t wave_rows_total_{0};
+    std::size_t wave_rows_max_{0};
+    std::mutex queue_mutex_;
+    std::condition_variable queue_ready_;
+    std::deque<OwnerSubmission> queue_;
+    std::uint32_t outstanding_{0};
+    std::uint32_t bound_;
+    bool running_{true};
+    std::thread thread_;
+};
+
 } // namespace
 
-EngineCapabilities serve_capabilities() {
+EngineCapabilities serve_capabilities(std::uint32_t concurrent_requests,
+                                      std::uint32_t queue_depth) {
     const auto& plan = tatara::model::qwen36::generated::kModelPlan;
     return EngineCapabilities{
         .context_capacity = plan.tokenizer.maximum_context,
-        .concurrent_requests = 1,
-        .queued_admission = false,
+        .concurrent_requests = concurrent_requests,
+        .queued_admission = concurrent_requests > 1 && queue_depth > 0,
         .request_deadlines = false,
         .bounded_drain = false,
         .prompt_reuse = true,
@@ -1171,7 +1825,7 @@ int run_serve(std::vector<std::string_view> arguments) {
         std::fputs(kServeUsage, stderr);
         return kExitUsage;
     }
-    PrefillMode prefill_mode = PrefillMode::SingleToken;
+    PrefillMode prefill_mode = PrefillMode::Graph;
     if (arguments.size() == 2) {
         if (arguments[1] == kPrefillModeGraph) {
             prefill_mode = PrefillMode::Graph;
@@ -1199,7 +1853,10 @@ int run_serve(std::vector<std::string_view> arguments) {
     }
     Configuration configuration = parsed.configuration;
     const auto execution_diagnostics =
-        validate_configuration_for_engine(configuration, serve_capabilities());
+        validate_configuration_for_engine(
+            configuration,
+            serve_capabilities(configuration.service.max_concurrent_requests,
+                               configuration.service.queue_depth));
     if (!execution_diagnostics.empty()) {
         std::fprintf(stderr, "serve: configuration exceeds the composed engine\n");
         for (const auto& diagnostic : execution_diagnostics) {
@@ -1236,11 +1893,14 @@ int run_serve(std::vector<std::string_view> arguments) {
 
     const host::HostFacts host_facts = host::read_host_facts();
     const bool graph_mode = prefill_mode == PrefillMode::Graph;
+    const std::uint32_t concurrent_lanes =
+        configuration.service.max_concurrent_requests;
     const ServingMemoryProfile memory_profile{
         .requested_context_capacity =
             configuration.service.max_context_tokens,
         .graph_scratch_lanes =
             configuration.memory.graph_scratch_lanes,
+        .concurrent_state_slots = concurrent_lanes,
         .composed_prefill = graph_mode,
         .physical_memory_bytes = host_facts.memory_bytes,
         .metal_working_set_bytes =
@@ -1365,6 +2025,23 @@ int run_serve(std::vector<std::string_view> arguments) {
     const std::string_view prefill_mode_name = prefill_mode == PrefillMode::Graph
                                                    ? kPrefillModeGraph
                                                    : kPrefillModeSingleToken;
+    if (configuration.service.max_concurrent_requests > 1) {
+        if (configuration.speculative.enabled) {
+            std::fputs(
+                "serve: max_concurrent_requests > 1 is incompatible with"
+                " speculative decoding; set speculative.enabled = false"
+                " or max_concurrent_requests = 1\n",
+                stderr);
+            return kExitConfigurationInvalid;
+        }
+        if (configuration.cache.prompt_reuse) {
+            std::fputs(
+                "serve: max_concurrent_requests > 1 is incompatible with"
+                " cache.prompt_reuse in this version\n",
+                stderr);
+            return kExitConfigurationInvalid;
+        }
+    }
     std::printf("serve: prefill mode %.*s\n",
                 static_cast<int>(prefill_mode_name.size()), prefill_mode_name.data());
     if (!configuration.speculative.draft_checkpoint.empty()) {
@@ -1395,7 +2072,7 @@ int run_serve(std::vector<std::string_view> arguments) {
         "serve: decode attention policy adaptive"
         " split-before=%u"
         " vector-at-or-after=%u"
-        " rollback-a23-fused-at=%u"
+        " fused-score-value-at=%u"
         " (performance crossovers; no capacity or output limit)\n",
         step.pipelines.vector_minimum_context,
         step.pipelines.vector_minimum_context,
@@ -1422,6 +2099,7 @@ int run_serve(std::vector<std::string_view> arguments) {
         }
         auto speculative_result = engine::create_speculative_engine(
             *harness.device, *harness.library, *harness.queue, step,
+            nullptr,
             harness.capacity, configuration.speculative.draft_checkpoint);
         if (!speculative_result) {
             std::fprintf(stderr,
@@ -1455,6 +2133,178 @@ int run_serve(std::vector<std::string_view> arguments) {
             static_cast<unsigned long long>(draft_cache_bytes >> 20),
             harness.capacity);
     }
+    std::unique_ptr<MultiStreamOwner> multi_owner;
+    std::vector<PrefillStepResult> join_prefill_steps;
+    if (concurrent_lanes > 1) {
+        PipelineResult join_pipelines = resolve_prefill_pipelines(
+            *harness.device, *harness.library,
+            /*native_dense_qgemm=*/true,
+            /*native_dense_steel=*/true,
+            /*native_dense_steel_gdn_bm64_wm2_wn2=*/false,
+            /*native_routed_qgemm=*/true,
+            /*native_routed_steel=*/true,
+            /*staged_attention=*/true,
+            /*command_graph=*/false);
+        if (!join_pipelines) {
+            std::fprintf(stderr,
+                         "serve: join prefill pipeline resolution failed"
+                         " (%d)\n",
+                         join_pipelines.exit_code);
+            return kExitRuntime;
+        }
+        const PrefillPolicy join_geometry_policy =
+            serve_prefill_geometry_policy(harness.capacity);
+        const auto join_geometry =
+            make_prefill_geometry(plan, join_geometry_policy);
+        if (!join_geometry) {
+            std::fputs("serve: join prefill geometry failed\n", stderr);
+            return kExitRuntime;
+        }
+        PrefillExecutionPolicy join_policy =
+            serve_prefill_execution_policy(join_geometry_policy, 1, false);
+        join_policy.command_graph = false;
+        join_policy.command_graph_chunk_count = 1;
+        // Narrow submissions: a wider join command buffer delays the
+        // decode waves it shares the queue with more than it shortens
+        // the joining lane's ramp.
+        join_policy.maximum_units_per_submission = 8;
+
+        // Two join streams: additional streams each cost a prefill
+        // scratch without shortening the ramp further.
+        const std::uint32_t join_streams = 2;
+        join_prefill_steps.push_back(create_prefill_step(
+            *harness.device, join_geometry.geometry, join_policy,
+            std::move(join_pipelines.pipelines)));
+        for (std::uint32_t extra = 1; extra < join_streams; ++extra) {
+            PipelineResult extra_pipelines = resolve_prefill_pipelines(
+                *harness.device, *harness.library,
+                /*native_dense_qgemm=*/true,
+                /*native_dense_steel=*/true,
+                /*native_dense_steel_gdn_bm64_wm2_wn2=*/false,
+                /*native_routed_qgemm=*/true,
+                /*native_routed_steel=*/true,
+                /*staged_attention=*/true,
+                /*command_graph=*/false);
+            if (!extra_pipelines) {
+                std::fputs("serve: join pipeline resolution failed\n",
+                           stderr);
+                return kExitRuntime;
+            }
+            join_prefill_steps.push_back(create_prefill_step(
+                *harness.device, join_geometry.geometry, join_policy,
+                std::move(extra_pipelines.pipelines)));
+        }
+        for (const PrefillStepResult& join_step : join_prefill_steps) {
+            if (!join_step) {
+                std::fprintf(stderr,
+                             "serve: join prefill step construction failed"
+                             " (%u)\n",
+                             static_cast<unsigned>(join_step.error));
+                return kExitRuntime;
+            }
+        }
+        const std::uint32_t group_count =
+            concurrent_lanes < 2
+                ? 1
+                : (2 > (concurrent_lanes + 15) / 16
+                       ? 2
+                       : (concurrent_lanes + 15) / 16);
+        std::vector<OwnerLaneGroup> lane_groups;
+        std::uint32_t assigned = 0;
+        for (std::uint32_t g = 0; g < group_count; ++g) {
+            const std::uint32_t remaining_groups = group_count - g;
+            const std::uint32_t size =
+                (concurrent_lanes - assigned + remaining_groups - 1) /
+                remaining_groups;
+            auto lane_pool =
+                create_decode_state_slot_pool(*harness.device, step, size);
+            auto group_scratch =
+                create_decode_batch_scratch(*harness.device, step, size);
+            if (!lane_pool || !group_scratch) {
+                std::fputs("serve: lane pool allocation failed\n", stderr);
+                return kExitRuntime;
+            }
+            OwnerLaneGroup group;
+            group.pool = std::move(*lane_pool.pool);
+            group.slots = std::move(lane_pool.slots);
+            group.batch_scratch = std::move(*group_scratch.scratch);
+            group.batch_scratch.dense_variant = 1;
+            lane_groups.push_back(std::move(group));
+            assigned += size;
+        }
+        std::vector<DecodeStreamScratch> lane_scratches;
+        for (std::uint32_t index = 0; index < concurrent_lanes; ++index) {
+            auto scratch =
+                create_decode_stream_scratch(*harness.device, step);
+            if (!scratch) {
+                std::fputs("serve: lane allocation failed\n", stderr);
+                return kExitRuntime;
+            }
+            lane_scratches.push_back(std::move(*scratch.scratch));
+        }
+        DecodeBatchPipelines batch_kernels;
+        {
+            const struct {
+                const char* name;
+                MetalComputePipeline* slot;
+            } batch_wanted[] = {
+                {"gdn_project_ms", &batch_kernels.gdn_project_ms},
+                {"gdn_outproj_ms", &batch_kernels.gdn_outproj_ms},
+                {"attn_project_ms", &batch_kernels.attn_project_ms},
+                {"lmhead_q4_ms", &batch_kernels.lmhead_ms},
+                {"embed_row_q4_ms", &batch_kernels.embed_ms},
+                {"rms_only_ms", &batch_kernels.rms_ms},
+                {"residual_rms_ms", &batch_kernels.residual_rms_ms},
+                {"gdn_gate_norm_ms", &batch_kernels.gate_norm_ms},
+                {"router_q8_ms", &batch_kernels.router_ms},
+                {"grouped_upgate_rows_ms", &batch_kernels.upgate_rows_ms},
+                {"grouped_down_res_rows_ms", &batch_kernels.down_rows_ms},
+                {"logits_argmax_stage1_ms",
+                 &batch_kernels.argmax_stage1_ms},
+                {"logits_argmax_stage2_ms",
+                 &batch_kernels.argmax_stage2_ms},
+                {"gdn_prepare_ms", &batch_kernels.gdn_prepare_ms},
+                {"gdn_recurrence_ms", &batch_kernels.gdn_recurrence_ms},
+                {"attn_qk_rope_ms", &batch_kernels.attn_qk_rope_ms},
+                {"router_select_ms", &batch_kernels.router_select_ms},
+                {"attention_decode_ms", &batch_kernels.attention_decode_ms},
+                {"gdn_project_ms_v2", &batch_kernels.gdn_project_ms_v2},
+                {"lmhead_q4_ms_v2", &batch_kernels.lmhead_ms_v2},
+                {"attn_project_ms_v2", &batch_kernels.attn_project_ms_v2},
+                {"gdn_outproj_ms_v2", &batch_kernels.gdn_outproj_ms_v2},
+            };
+            for (const auto& entry : batch_wanted) {
+                auto function =
+                    create_function(*harness.library, entry.name);
+                auto pipeline = function
+                                    ? create_compute_pipeline(
+                                          *harness.device,
+                                          *function.function)
+                                    : MetalComputePipelineResult{};
+                if (!pipeline) {
+                    std::fprintf(stderr,
+                                 "serve: batch pipeline %s resolution"
+                                 " failed\n",
+                                 entry.name);
+                    return kExitRuntime;
+                }
+                *entry.slot = std::move(*pipeline.pipeline);
+            }
+        }
+        std::vector<PrefillStep*> join_stream_pointers;
+        for (PrefillStepResult& join_step : join_prefill_steps) {
+            join_stream_pointers.push_back(&*join_step.step);
+        }
+        multi_owner = std::make_unique<MultiStreamOwner>(
+            harness, std::move(join_stream_pointers),
+            std::move(lane_groups),
+            std::move(lane_scratches), std::move(batch_kernels),
+            configuration.service.queue_depth);
+        std::printf(
+            "serve: multi-stream owner ready lanes=%u queue=%u\n",
+            multi_owner->lane_count(),
+            configuration.service.queue_depth);
+    }
     ServePrefixCache prefix_cache;
     if (!boot_prefix_cache(
             configuration, prefill_mode, harness, prefill,
@@ -1466,11 +2316,15 @@ int run_serve(std::vector<std::string_view> arguments) {
             "serve: prefix cache bypassed under speculative decoding");
     }
 
+    std::mutex metrics_mutex;
     ServerHooks hooks;
     hooks.snapshot = [&]() {
         ServiceSnapshot snapshot;
         snapshot.readiness = readiness.load();
-        snapshot.counters = counters;
+        {
+            std::lock_guard<std::mutex> guard(metrics_mutex);
+            snapshot.counters = counters;
+        }
         snapshot.gauges.queue_depth = configuration.service.queue_depth;
         snapshot.gauges.uptime_seconds =
             static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(
@@ -1492,8 +2346,25 @@ int run_serve(std::vector<std::string_view> arguments) {
     };
     hooks.completions =
         [&](Route route, const std::string& body, Generation& generation) {
+        // Request-scoped failure: this request 500s, the server keeps
+        // serving. Reserved for per-lane/per-request faults in owner
+        // mode; engine-fatal paths still use fail_engine below.
+        const auto fail_request =
+            [&](std::string_view detail) {
+                std::fprintf(stderr, "serve: request failed: %.*s\n",
+                             static_cast<int>(detail.size()),
+                             detail.data());
+                generation.response_status = 500;
+                generation.body =
+                    render_error(detail, "server_error",
+                                 "tatara.request_failed");
+                return true;
+            };
         const auto fail_engine =
             [&](std::string_view detail) {
+                std::fprintf(stderr, "serve: ENGINE FAILED: %.*s\n",
+                             static_cast<int>(detail.size()),
+                             detail.data());
                 readiness.store(Readiness::Failed);
                 generation.response_status = 500;
                 generation.body =
@@ -1504,6 +2375,11 @@ int run_serve(std::vector<std::string_view> arguments) {
                 }
                 return false;
             };
+        const auto bump = [&](std::uint64_t& field,
+                              std::uint64_t amount = 1) {
+            std::lock_guard<std::mutex> guard(metrics_mutex);
+            field += amount;
+        };
         auto parsed_request =
             parse_completion_request(route, body, plan.id, plan.tokenizer,
                                      request_limits);
@@ -1514,7 +2390,7 @@ int run_serve(std::vector<std::string_view> arguments) {
                 render_error(parsed_request.detail, "invalid_request_error",
                              completion_request_code(parsed_request.error));
             if (generation.response_status == 413) {
-                counters.requests_rejected_context += 1;
+                bump(counters.requests_rejected_context);
             }
             return false;
         }
@@ -1528,7 +2404,7 @@ int run_serve(std::vector<std::string_view> arguments) {
                 render_error(prepared.detail, "invalid_request_error",
                              completion_request_code(prepared.error));
             if (generation.response_status == 413) {
-                counters.requests_rejected_context += 1;
+                bump(counters.requests_rejected_context);
             }
             return false;
         }
@@ -1536,8 +2412,8 @@ int run_serve(std::vector<std::string_view> arguments) {
         generation.stream = request.stream;
         const std::vector<std::uint32_t>& prompt = request.prompt_tokens;
         const std::uint32_t requested = request.maximum_tokens;
-        counters.requests_admitted += 1;
-        counters.prompt_tokens += prompt.size();
+        bump(counters.requests_admitted);
+        bump(counters.prompt_tokens, prompt.size());
 
         std::vector<std::uint32_t> produced;
         std::string completion_text;
@@ -1568,8 +2444,9 @@ int run_serve(std::vector<std::string_view> arguments) {
             route == Route::ChatCompletions && request.enable_thinking;
         bool stopped = false;
         bool spec_request_active = static_cast<bool>(speculative);
-        const bool cache_active =
-            prefix_cache.enabled() && !speculative;
+        const bool cache_active = prefix_cache.enabled() &&
+                                  !speculative &&
+                                  multi_owner == nullptr;
         const std::uint32_t prefill_end =
             static_cast<std::uint32_t>(prompt.size()) - 1u;
         const runtime::SlotHandle cache_slot{
@@ -1602,7 +2479,7 @@ int run_serve(std::vector<std::string_view> arguments) {
                      .slot_generation =
                          cache_slot.slot_generation});
             if (lookup.error != PrefixCacheError::None) {
-                counters.prefix_cache_lookup_failures += 1;
+                bump(counters.prefix_cache_lookup_failures);
                 std::fprintf(
                     stderr,
                     "serve: prefix-cache lookup failed error=%u\n",
@@ -1615,18 +2492,18 @@ int run_serve(std::vector<std::string_view> arguments) {
                 if (!execute_prefix_restore(
                         prefix_cache, harness, *cache_request,
                         cache_slot, *lookup.lease)) {
-                    counters.prefix_cache_restore_failures += 1;
+                    bump(counters.prefix_cache_restore_failures);
                     std::fputs(
                         "serve: prefix-cache restore failed\n",
                         stderr);
                     return fail_engine("prefix-cache restore failed");
                 }
-                counters.prefix_cache_hits += 1;
+                bump(counters.prefix_cache_hits);
             } else {
-                counters.prefix_cache_misses += 1;
+                bump(counters.prefix_cache_misses);
             }
         }
-        if (cache_hit_position == 0 &&
+        if (multi_owner == nullptr && cache_hit_position == 0 &&
             !execute_state_slot_reset(harness)) {
             std::fputs(
                 "serve: typed state-slot reset failed\n", stderr);
@@ -1657,7 +2534,7 @@ int run_serve(std::vector<std::string_view> arguments) {
                     std::fputs(
                         "serve: prefix-cache snapshot layout failed\n",
                         stderr);
-                    counters.prefix_cache_snapshot_failures += 1;
+                    bump(counters.prefix_cache_snapshot_failures);
                     return fail_engine(
                         "prefix-cache snapshot layout failed");
                 }
@@ -1684,11 +2561,11 @@ int run_serve(std::vector<std::string_view> arguments) {
                         "serve: prefix-cache reservation failed"
                         " error=%u\n",
                         static_cast<unsigned>(reserved.error));
-                    counters.prefix_cache_snapshot_failures += 1;
+                    bump(counters.prefix_cache_snapshot_failures);
                     return fail_engine(
                         "prefix-cache reservation invariant failed");
                 } else {
-                    counters.prefix_cache_reservation_skips += 1;
+                    bump(counters.prefix_cache_reservation_skips);
                     const std::string_view skip =
                         prefix_cache_error_name(reserved.error);
                     std::fprintf(
@@ -1717,6 +2594,7 @@ int run_serve(std::vector<std::string_view> arguments) {
         const std::uint32_t steps = static_cast<std::uint32_t>(prompt.size()) + requested - 1u;
         std::uint32_t start_index = cache_hit_position;
         if (prefill_mode == PrefillMode::Graph &&
+            multi_owner == nullptr &&
             prefill_end > cache_hit_position) {
             PrefillStep& graph_prefill = *prefill.step;
             const std::span<const std::uint32_t> prefill_ids(
@@ -1912,7 +2790,7 @@ int run_serve(std::vector<std::string_view> arguments) {
                             *cache_request, cache_slot,
                             *cache_reservation,
                             snapshot_publication.transaction)) {
-                        counters.prefix_cache_snapshot_failures += 1;
+                        bump(counters.prefix_cache_snapshot_failures);
                         std::fputs(
                             "serve: prefix-cache snapshot failed\n",
                             stderr);
@@ -1960,7 +2838,7 @@ int run_serve(std::vector<std::string_view> arguments) {
                 return EmitOutcome::Stopped;
             }
             produced.push_back(token);
-            counters.generated_tokens += 1;
+            bump(counters.generated_tokens);
             if (text_response) {
                 if (route == Route::ChatCompletions &&
                     token == plan.tokenizer.thinking_start_id) {
@@ -1992,10 +2870,10 @@ int run_serve(std::vector<std::string_view> arguments) {
                               << json_escape(chunk.bytes) << "\"}]}";
                     }
                     if (!generation.emit(event.str())) {
-                        counters.requests_cancelled += 1;
+                        bump(counters.requests_cancelled);
                         if (!snapshot_publication.resolve(
                                 engine::PrefixCacheTerminalDisposition::Cancelled)) {
-                            counters.prefix_cache_snapshot_failures += 1;
+                            bump(counters.prefix_cache_snapshot_failures);
                             fail_engine(
                                 "prefix-cache cancellation resolution failed");
                             return EmitOutcome::StreamFail;
@@ -2008,10 +2886,10 @@ int run_serve(std::vector<std::string_view> arguments) {
                 event << "{\"choices\":[{\"delta\":{\"token\":" << token
                       << "}}]}";
                 if (!generation.emit(event.str())) {
-                    counters.requests_cancelled += 1;
+                    bump(counters.requests_cancelled);
                     if (!snapshot_publication.resolve(
                             engine::PrefixCacheTerminalDisposition::Cancelled)) {
-                        counters.prefix_cache_snapshot_failures += 1;
+                        bump(counters.prefix_cache_snapshot_failures);
                         fail_engine(
                             "prefix-cache cancellation resolution failed");
                         return EmitOutcome::StreamFail;
@@ -2021,6 +2899,70 @@ int run_serve(std::vector<std::string_view> arguments) {
             }
             return EmitOutcome::Continue;
         };
+        bool owner_served = false;
+        if (multi_owner != nullptr) {
+            owner_served = true;
+            auto channel = std::make_shared<LaneChannel>();
+            auto cancel_flag =
+                std::make_shared<std::atomic<bool>>(false);
+            OwnerSubmission submission;
+            submission.prompt = prompt;
+            submission.stop_ids = request.stop_token_ids;
+            submission.maximum_tokens = requested;
+            submission.channel = channel;
+            submission.cancelled = cancel_flag;
+            if (!multi_owner->submit(std::move(submission))) {
+                generation.response_status = 429;
+                generation.body = render_error(
+                    "engine at capacity", "rate_limit_error",
+                    "tatara.queue_full");
+                return false;
+            }
+            bool finished = false;
+            LaneDoneReason reason = LaneDoneReason::Failed;
+            while (!finished) {
+                std::uint32_t token = 0;
+                bool have_token = false;
+                {
+                    std::unique_lock<std::mutex> lock(channel->mutex);
+                    channel->ready.wait_for(
+                        lock, std::chrono::milliseconds(50), [&] {
+                            return !channel->tokens.empty() ||
+                                   channel->done;
+                        });
+                    if (!channel->tokens.empty()) {
+                        token = channel->tokens.front();
+                        channel->tokens.pop_front();
+                        have_token = true;
+                    } else if (channel->done) {
+                        finished = true;
+                        reason = channel->reason;
+                    }
+                }
+                if (have_token) {
+                    const EmitOutcome outcome = emit_token(token);
+                    if (outcome == EmitOutcome::CancelledDone) {
+                        cancel_flag->store(true);
+                        return true;
+                    }
+                    if (outcome == EmitOutcome::StreamFail) {
+                        cancel_flag->store(true);
+                        return false;
+                    }
+                    continue;
+                }
+                if (!finished && generation.cancelled()) {
+                    cancel_flag->store(true);
+                }
+            }
+            if (reason == LaneDoneReason::Failed) {
+                return fail_request("engine lane failed");
+            }
+            if (reason == LaneDoneReason::Cancelled) {
+                bump(counters.requests_cancelled);
+                return true;
+            }
+        }
         const bool spec_generation = spec_request_active;
         bool spec_serial_handoff = false;
         std::uint32_t spec_staged = 0;
@@ -2097,10 +3039,10 @@ int run_serve(std::vector<std::string_view> arguments) {
                 std::uint64_t spec_committed_total = 0;
                 while (true) {
                     if (generation.cancelled()) {
-                        counters.requests_cancelled += 1;
+                        bump(counters.requests_cancelled);
                         if (!snapshot_publication.resolve(
                                 engine::PrefixCacheTerminalDisposition::Cancelled)) {
-                            counters.prefix_cache_snapshot_failures += 1;
+                            bump(counters.prefix_cache_snapshot_failures);
                             return fail_engine(
                                 "prefix-cache cancellation resolution failed");
                         }
@@ -2164,10 +3106,10 @@ int run_serve(std::vector<std::string_view> arguments) {
                 std::uint32_t current = spec_staged;
                 while (true) {
                     if (generation.cancelled()) {
-                        counters.requests_cancelled += 1;
+                        bump(counters.requests_cancelled);
                         if (!snapshot_publication.resolve(
                                 engine::PrefixCacheTerminalDisposition::Cancelled)) {
-                            counters.prefix_cache_snapshot_failures += 1;
+                            bump(counters.prefix_cache_snapshot_failures);
                             return fail_engine(
                                 "prefix-cache cancellation resolution failed");
                         }
@@ -2234,13 +3176,13 @@ int run_serve(std::vector<std::string_view> arguments) {
                 }
             }
         }
-        if (!spec_generation)
+        if (!spec_generation && !owner_served)
         for (std::uint32_t index = start_index; index < steps; ++index) {
             if (generation.cancelled()) {
-                counters.requests_cancelled += 1;
+                bump(counters.requests_cancelled);
                 if (!snapshot_publication.resolve(
                         engine::PrefixCacheTerminalDisposition::Cancelled)) {
-                    counters.prefix_cache_snapshot_failures += 1;
+                    bump(counters.prefix_cache_snapshot_failures);
                     return fail_engine(
                         "prefix-cache cancellation resolution failed");
                 }
@@ -2290,7 +3232,7 @@ int run_serve(std::vector<std::string_view> arguments) {
                         prefix_cache, harness, *cache_request,
                         cache_slot, *cache_reservation,
                         snapshot_publication.transaction)) {
-                    counters.prefix_cache_snapshot_failures += 1;
+                    bump(counters.prefix_cache_snapshot_failures);
                     std::fputs(
                         "serve: prefix-cache snapshot failed\n",
                         stderr);
@@ -2327,7 +3269,7 @@ int run_serve(std::vector<std::string_view> arguments) {
                           : engine::PrefixCacheTerminalDisposition::
                                 SuccessfulMaximumOutput;
         if (!snapshot_publication.resolve(cache_terminal)) {
-            counters.prefix_cache_snapshot_failures += 1;
+            bump(counters.prefix_cache_snapshot_failures);
             std::fputs(
                 "serve: prefix-cache terminal publication failed\n",
                 stderr);
@@ -2335,7 +3277,7 @@ int run_serve(std::vector<std::string_view> arguments) {
                 "prefix-cache terminal publication failed");
         }
         if (snapshot_publication.published) {
-            counters.prefix_cache_publications += 1;
+            bump(counters.prefix_cache_publications);
         }
 
         std::ostringstream out;
@@ -2359,7 +3301,7 @@ int run_serve(std::vector<std::string_view> arguments) {
         out << ",\"usage\":{\"prompt_tokens\":" << prompt.size()
             << ",\"completion_tokens\":" << produced.size() << "}}";
         generation.body = out.str();
-        counters.requests_completed += 1;
+        bump(counters.requests_completed);
         return true;
     };
 

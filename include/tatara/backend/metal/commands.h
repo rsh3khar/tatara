@@ -258,6 +258,7 @@ enum class MetalCommandError : std::uint8_t {
     InvalidResourceUsage,
     IndirectCommandBufferCreationFailed,
     InvalidDevice,
+    InvalidStreamGroup,
 };
 
 enum class MetalResourceUsage : std::uint8_t {

@@ -1,7 +1,7 @@
-// The native `tatara` command. VISION.md §7 requires the shipped distribution
-// to carry its own CLI with no Python runtime, and commands that do not touch
-// the GPU must not load Metal or open the model -- that is what keeps `doctor`
-// and `--help` instant.
+// The native `tatara` command: the shipped distribution carries its own CLI
+// with no Python runtime, and commands that do not touch the GPU must not
+// load Metal or open the model, which is what keeps `doctor` and `--help`
+// instant.
 
 #include "tatara_benchmark.h"
 #include "tatara_serve.h"
@@ -23,8 +23,8 @@
 
 namespace {
 
-// Exit contract from docs/design/SERVICE_CONTRACTS.md. Only 0 and 1 carry a
-// verdict; every other code means the verdict is unknown.
+// Exit contract: only 0 and 1 carry a verdict; every other code means the
+// verdict is unknown.
 constexpr int kExitVerdictPositive = 0;
 constexpr int kExitUsage = 2;
 constexpr int kExitConfigurationInvalid = 3;
@@ -77,7 +77,8 @@ int run_config_check(std::vector<std::string_view> arguments) {
     }
     const auto& configuration = result.configuration;
     const auto execution_diagnostics = tatara::service::validate_configuration_for_engine(
-        configuration, tatara::tools::serve_capabilities());
+        configuration, tatara::tools::serve_capabilities(configuration.service.max_concurrent_requests,
+                                     configuration.service.queue_depth));
     if (!execution_diagnostics.empty()) {
         std::printf("verdict: failed\n");
         for (const auto& diagnostic : execution_diagnostics) {
@@ -95,7 +96,8 @@ int run_config_check(std::vector<std::string_view> arguments) {
         std::printf(
             "limits: context automatic (model maximum %u),"
             " %u concurrent, queue %u\n",
-            tatara::tools::serve_capabilities().context_capacity,
+            tatara::tools::serve_capabilities(configuration.service.max_concurrent_requests,
+                                     configuration.service.queue_depth).context_capacity,
             configuration.service.max_concurrent_requests,
             configuration.service.queue_depth);
     } else {
@@ -103,7 +105,8 @@ int run_config_check(std::vector<std::string_view> arguments) {
             "limits: requested context %u (model maximum %u),"
             " %u concurrent, queue %u\n",
             configuration.service.max_context_tokens,
-            tatara::tools::serve_capabilities().context_capacity,
+            tatara::tools::serve_capabilities(configuration.service.max_concurrent_requests,
+                                     configuration.service.queue_depth).context_capacity,
             configuration.service.max_concurrent_requests,
             configuration.service.queue_depth);
     }
@@ -208,7 +211,7 @@ constexpr Command kCommands[] = {
 };
 
 int usage(std::FILE* stream) {
-    std::fprintf(stream, "tatara %.*s — Apple-silicon inference engine\n\n",
+    std::fprintf(stream, "tatara %.*s, Apple-silicon inference engine\n\n",
                  static_cast<int>(tatara::kVersion.size()),
                  tatara::kVersion.data());
     std::fprintf(stream, "usage: tatara <command> [arguments]\n\ncommands:\n");
@@ -217,9 +220,7 @@ int usage(std::FILE* stream) {
                      command.name.data(), static_cast<int>(command.summary.size()),
                      command.summary.data());
     }
-    std::fprintf(stream, "\ndoctor, inspect, prepare, validate, tune, benchmark and serve are\n"
-                         "specified in docs/design/SERVICE_CONTRACTS.md and land as they are\n"
-                         "implemented. A command appears here only when it works.\n");
+    std::fprintf(stream, "\nA command appears here only when it works.\n");
     return stream == stdout ? kExitVerdictPositive : kExitUsage;
 }
 

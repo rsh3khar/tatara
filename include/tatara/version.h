@@ -5,7 +5,7 @@
 
 namespace tatara {
 
-inline constexpr std::string_view kVersion = "0.1.0";
+inline constexpr std::string_view kVersion = "0.2.0";
 
 // Evidence-backed release support claim. Serving admission remains an
 // independent model-and-memory computation and can admit a larger context.

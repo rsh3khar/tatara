@@ -147,10 +147,61 @@ void cache_tradeoff_and_typed_refusal() {
 
 } // namespace
 
+void concurrent_state_slots_scale_and_shrink_admission() {
+    const auto& model =
+        tatara::model::qwen36::generated::kModelPlan;
+    const PrefillPolicy policy =
+        geometry_policy(model.tokenizer.maximum_context);
+    const ServingCapacityResult one = plan_serving_capacity(
+        model, profile(0), policy, execution_policy(policy, 3));
+    ServingMemoryProfile four_slots = profile(0);
+    four_slots.concurrent_state_slots = 4;
+    const ServingCapacityResult four = plan_serving_capacity(
+        model, four_slots, policy, execution_policy(policy, 3));
+    check(static_cast<bool>(one) && static_cast<bool>(four),
+          "one- and four-slot profiles both plan");
+    check(one.admitted.state_slots == 1 &&
+              four.admitted.state_slots == 4,
+          "breakdown records the planned slot count");
+    check(four.maximum_admissible_context <=
+              one.maximum_admissible_context,
+          "more slots never admit more context");
+
+    ServingMemoryProfile fixed_one = profile(0);
+    fixed_one.requested_context_capacity = 16384;
+    ServingMemoryProfile fixed_four = fixed_one;
+    fixed_four.concurrent_state_slots = 4;
+    const ServingCapacityResult fixed_one_plan = plan_serving_capacity(
+        model, fixed_one, policy, execution_policy(policy, 3));
+    const ServingCapacityResult fixed_four_plan = plan_serving_capacity(
+        model, fixed_four, policy, execution_policy(policy, 3));
+    check(static_cast<bool>(fixed_one_plan) &&
+              static_cast<bool>(fixed_four_plan),
+          "fixed 16k context plans at one and four slots");
+    check(fixed_four_plan.admitted.decode_slot_bytes ==
+              4 * fixed_one_plan.admitted.decode_slot_bytes,
+          "at equal context four slots cost exactly four times the"
+          " slot state bytes");
+
+    ServingMemoryProfile zero_slots = profile(0);
+    zero_slots.concurrent_state_slots = 0;
+    const ServingCapacityResult normalized = plan_serving_capacity(
+        model, zero_slots, policy, execution_policy(policy, 3));
+    check(static_cast<bool>(normalized) &&
+              normalized.admitted.state_slots == 1,
+          "zero slots normalizes to the serial shape");
+    check(normalized.admitted.decode_slot_bytes ==
+              one.admitted.decode_slot_bytes &&
+          normalized.maximum_admissible_context ==
+              one.maximum_admissible_context,
+          "normalized zero-slot plan is byte-identical to one slot");
+}
+
 int main() {
     exact_65536_budget();
     model_maximum_has_no_engine_ceiling();
     cache_tradeoff_and_typed_refusal();
+    concurrent_state_slots_scale_and_shrink_admission();
     if (failures == 0) {
         std::printf("serving capacity: PASS\n");
     }

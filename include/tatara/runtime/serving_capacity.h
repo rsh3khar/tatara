@@ -27,6 +27,11 @@ struct ServingMemoryProfile {
     // operator request, not a second model/product ceiling.
     std::uint32_t requested_context_capacity{0};
     std::uint32_t graph_scratch_lanes{1};
+    // Persistent decode state slots the plan must hold resident. Every
+    // slot carries the full per-request state (KV at the admitted
+    // context plus the gated-delta planes); one slot is the serial
+    // serving shape.
+    std::uint32_t concurrent_state_slots{1};
     bool composed_prefill{false};
 
     std::uint64_t physical_memory_bytes{0};
@@ -44,6 +49,7 @@ struct ServingMemoryProfile {
 
 struct ServingCapacityBreakdown {
     std::uint32_t context_capacity{0};
+    std::uint32_t state_slots{1};
     std::uint64_t prepared_image_bytes{0};
     std::uint64_t decode_slot_bytes{0};
     std::uint64_t decode_scratch_bytes{0};

@@ -170,6 +170,85 @@ struct DecodeStateSlotResult {
     }
 };
 
+// One pool buffer per layer per state kind, holding every slot's state as
+// equal stripes. Gated layers interleave ping-pong parities: slot s holds
+// stripes 2s and 2s+1, so a kernel reaches both through one binding.
+// Slots built over a pool behave as ordinary slots everywhere else.
+struct DecodeStatePoolLayer {
+    backend::metal::MetalBuffer first;
+    backend::metal::MetalBuffer second;
+    std::uint64_t first_stride{0};
+    std::uint64_t second_stride{0};
+};
+
+struct DecodeStatePool {
+    std::uint32_t stripes{0};
+    std::vector<DecodeStatePoolLayer> layers;
+};
+
+struct DecodeStateSlotPoolResult {
+    DecodeStepError error;
+    std::optional<DecodeStatePool> pool;
+    std::vector<DecodeStateSlot> slots;
+
+    explicit operator bool() const noexcept {
+        return error == DecodeStepError::None && pool.has_value();
+    }
+};
+
+// Per-stream token scratch: every buffer one token walk writes. A group
+// submission interleaves layers across streams, so each stream owns its
+// scratch and the step's own buffers serve at most one stream.
+struct DecodeStreamScratch {
+    backend::metal::MetalBuffer input;
+    backend::metal::MetalBuffer normed;
+    backend::metal::MetalBuffer branch_stream;
+    backend::metal::MetalBuffer residual_stream;
+    backend::metal::MetalBuffer moe_stream;
+    backend::metal::MetalBuffer layer_stream;
+    backend::metal::MetalBuffer gdn_projection;
+    backend::metal::MetalBuffer gdn_qk;
+    backend::metal::MetalBuffer gdn_value;
+    backend::metal::MetalBuffer gdn_z;
+    backend::metal::MetalBuffer gdn_y;
+    backend::metal::MetalBuffer gdn_gated;
+    backend::metal::MetalBuffer attn_projection;
+    backend::metal::MetalBuffer attn_query;
+    backend::metal::MetalBuffer attn_gate;
+    backend::metal::MetalBuffer attn_attended;
+    backend::metal::MetalBuffer attn_partials;
+    backend::metal::MetalBuffer attn_weights;
+    backend::metal::MetalBuffer router_logits;
+    backend::metal::MetalBuffer expert_ids;
+    backend::metal::MetalBuffer expert_coefficients;
+    backend::metal::MetalBuffer shared_coefficient;
+    backend::metal::MetalBuffer expert_hidden;
+    backend::metal::MetalBuffer final_hidden;
+    backend::metal::MetalBuffer logits;
+    backend::metal::MetalBuffer argmax_values;
+    backend::metal::MetalBuffer argmax_indices;
+    backend::metal::MetalBuffer token_id;
+};
+
+struct DecodeStreamScratchResult {
+    DecodeStepError error;
+    std::optional<DecodeStreamScratch> scratch;
+
+    explicit operator bool() const noexcept {
+        return error == DecodeStepError::None && scratch.has_value();
+    }
+};
+
+// One stream of a group submission. A null scratch selects the step's
+// own scratch; at most one stream per group may do so, and states and
+// scratches must be pairwise distinct.
+struct DecodeStream {
+    DecodeStateSlot* state{nullptr};
+    DecodeStreamScratch* scratch{nullptr};
+    std::uint32_t context{0};
+    std::uint32_t stripe{0};
+};
+
 // Allocates zeroed working buffers and states (the sealed zeroed-allocation
 // rule: allocator recycling must never perturb results). The image buffer
 // must outlive the step; tensor_offsets is the image layout parallel to the
@@ -184,6 +263,99 @@ create_decode_step(const backend::metal::MetalDevice& device, const DecodeGeomet
 // The step and its immutable schedule storage must outlive the slot.
 DecodeStateSlotResult create_decode_state_slot(const backend::metal::MetalDevice& device,
                                                const DecodeStep& step);
+
+// Allocates count zeroed persistent slots striped over shared per-layer
+// pool buffers. The slots behave exactly like create_decode_state_slot
+// slots on every existing path; the pool exists for row-batched kernels.
+DecodeStateSlotPoolResult create_decode_state_slot_pool(
+    const backend::metal::MetalDevice& device, const DecodeStep& step, std::uint32_t count);
+
+// Allocates one zeroed per-stream scratch set sized by the step's
+// geometry, for group submissions.
+DecodeStreamScratchResult create_decode_stream_scratch(
+    const backend::metal::MetalDevice& device, const DecodeStep& step);
+
+// Batched-token scratch: every per-token buffer as an [rows x stride]
+// slab. Unbatched kernels run per row through buffer offsets; the _ms
+// kernels consume whole slabs. Strides are the single-stream byte sizes.
+struct DecodeBatchScratch {
+    std::uint32_t rows{0};
+    // Rows per threadgroup in each dense projection stage: tile-of-rows
+    // grids trade weight-load amortization against row parallelism. Any
+    // value in [1, rows] is exact per stage.
+    std::uint32_t project_row_tile{8};
+    std::uint32_t outproj_row_tile{8};
+    std::uint32_t attnproj_row_tile{8};
+    // Timing instrument: when nonzero, the numbered stage encodes its
+    // dispatch twice. Stage inputs and outputs are distinct buffers, so
+    // doubling is idempotent and walks stay byte-exact.
+    std::uint32_t profile_double_stage{0};
+    // Rows per threadgroup in the vocabulary head. The full loop maximizes
+    // weight amortization of the largest read; smaller tiles trade re-reads
+    // for row parallelism. Any value in [1, rows] is exact.
+    std::uint32_t head_row_tile{8};
+    // Dense-stage kernel variant: 0 scalar loads, 1 vector loads
+    // (bit-identical per row; load width only). Variant pipelines must
+    // be resolved when set.
+    std::uint32_t dense_variant{0};
+    DecodeStreamScratch slabs;
+    backend::metal::MetalBuffer union_table;
+    backend::metal::MetalBuffer moe_parts;
+    backend::metal::MetalBuffer state_offsets;
+};
+
+struct DecodeBatchScratchResult {
+    DecodeStepError error;
+    std::optional<DecodeBatchScratch> scratch;
+
+    explicit operator bool() const noexcept {
+        return error == DecodeStepError::None && scratch.has_value();
+    }
+};
+
+DecodeBatchScratchResult create_decode_batch_scratch(
+    const backend::metal::MetalDevice& device, const DecodeStep& step,
+    std::uint32_t rows);
+
+// Row-batched dense kernels (weight traffic shared across rows; per-row
+// numerics identical to the serial kernels).
+struct DecodeBatchPipelines {
+    backend::metal::MetalComputePipeline gdn_project_ms;
+    backend::metal::MetalComputePipeline gdn_outproj_ms;
+    backend::metal::MetalComputePipeline attn_project_ms;
+    backend::metal::MetalComputePipeline lmhead_ms;
+    backend::metal::MetalComputePipeline embed_ms;
+    backend::metal::MetalComputePipeline rms_ms;
+    backend::metal::MetalComputePipeline residual_rms_ms;
+    backend::metal::MetalComputePipeline gate_norm_ms;
+    backend::metal::MetalComputePipeline router_ms;
+    backend::metal::MetalComputePipeline upgate_rows_ms;
+    backend::metal::MetalComputePipeline down_rows_ms;
+    backend::metal::MetalComputePipeline argmax_stage1_ms;
+    backend::metal::MetalComputePipeline argmax_stage2_ms;
+    backend::metal::MetalComputePipeline gdn_prepare_ms;
+    backend::metal::MetalComputePipeline gdn_recurrence_ms;
+    backend::metal::MetalComputePipeline attn_qk_rope_ms;
+    backend::metal::MetalComputePipeline router_select_ms;
+    backend::metal::MetalComputePipeline attention_decode_ms;
+    backend::metal::MetalComputePipeline gdn_project_ms_v2;
+    backend::metal::MetalComputePipeline lmhead_ms_v2;
+    backend::metal::MetalComputePipeline attn_project_ms_v2;
+    backend::metal::MetalComputePipeline gdn_outproj_ms_v2;
+};
+
+// One batched token step for up to eight streams over pool-striped slots.
+// The host writes the per-step state-offset table before encoding, so the
+// previous step must have completed. Per-stream trajectories are
+// bit-identical to the serial walk. chain_input, when set, replaces this
+// scratch's token slab as the embed input, chaining steps on the GPU so a
+// next step can be committed before the current one completes.
+backend::metal::MetalCommandError encode_token_batch(
+    DecodeStep& step, std::span<const DecodeStream> streams,
+    const DecodeStatePool& pool, DecodeBatchScratch& batch,
+    const DecodeBatchPipelines& kernels,
+    backend::metal::MetalComputePass& pass,
+    const backend::metal::MetalBuffer* chain_input = nullptr);
 
 bool decode_state_slot_compatible(const DecodeStep& step, const DecodeStateSlot& state) noexcept;
 bool decode_state_slot_complete(const DecodeStep& step, const DecodeStateSlot& state) noexcept;
@@ -200,6 +372,14 @@ encode_token(DecodeStep& step, backend::metal::MetalComputePass& pass, std::uint
 backend::metal::MetalCommandError encode_token(DecodeStep& step, DecodeStateSlot& state,
                                                backend::metal::MetalComputePass& pass,
                                                std::uint32_t context);
+
+// Encodes one token step for every stream into the same pass,
+// layer-interleaved: each layer's weights are visited once while all
+// streams consume them. Per-stream numerics are identical to the serial
+// walk; streams advance independently.
+backend::metal::MetalCommandError encode_token_group(
+    DecodeStep& step, std::span<const DecodeStream> streams,
+    backend::metal::MetalComputePass& pass);
 
 // Swaps the gated-delta conv and recurrent pairs after a token completes.
 void advance_decode_state(DecodeStep& step);

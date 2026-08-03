@@ -15,7 +15,7 @@
 #include <vector>
 
 // Serial teacher-forced prefill (eighth boundary contract in
-// docs/design/COMPONENT_EXECUTION.md, TATARA-PREFILL1).
+// the component execution contract).
 //
 // Drives the sealed single-token decode step at contexts 0..N-1 from a cold
 // cache, injecting the prompt's own token id before each step instead of
@@ -24,7 +24,7 @@
 // accumulating state from an EMPTY cache rather than from a loaded record,
 // which nothing in Phase 3 had exercised.
 //
-// The parity target is the champion's DECODE path teacher-forced over the same
+// The parity target is the decode path teacher-forced over the same
 // ids -- the same kernel set. Its own prefill path binds *_blk kernels, which
 // are different Metal functions, so gating against those would be a false gate
 // wearing a byte-exact label.
@@ -170,7 +170,7 @@ Occupancy measure_occupancy(const DecodeStep& step, std::span<const LayerKind> s
     return report;
 }
 
-// ---- TATARA-EXEC7 layer-boundary capture.
+// ---- layer-boundary capture.
 //
 // The eighth boundary's state record captures layer *states*; the divergence
 // it found at N=2048 originates in a layer *output*, which the state record
@@ -178,7 +178,7 @@ Occupancy measure_occupancy(const DecodeStep& step, std::span<const LayerKind> s
 // host-visible buffers with identical geometry, so the instrument is a pure
 // host read after the completion wait -- no new dispatch, no kernel change and
 // nothing on the encode path moves. The record layout (`Q36BND01`) is frozen
-// in docs/design/COMPONENT_EXECUTION.md and must match the champion's
+// by the component execution contract and must match the decode path's
 // byte-for-byte, including this hash, or the comparison is meaningless.
 
 constexpr std::uint64_t kFnvOffsetBasis = 14695981039346656037ull;
@@ -293,7 +293,7 @@ int main(int argument_count, char** arguments) {
         }
         // The record's shape is proven from the geometry rather than assumed,
         // so a layout change upstream fails here instead of silently writing a
-        // record the champion's comparator would misread.
+        // record the comparator would misread.
         if (step.geometry.layer_stream_bytes != boundary_stream_bytes) {
             std::cerr << "layer stream is " << step.geometry.layer_stream_bytes
                       << " bytes, expected " << boundary_stream_bytes << " for " << layers

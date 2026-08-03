@@ -1,7 +1,7 @@
 #pragma once
 
 // Fixture batteries for the safe-math suite (seventh boundary contract,
-// docs/design/COMPONENT_EXECUTION.md).
+// the component execution contract).
 //
 // Each battery is the unmodified body of the family's original fixture probe,
 // exposed as a callable so the suite can run all six in one process — one

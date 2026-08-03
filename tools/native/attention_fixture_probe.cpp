@@ -878,7 +878,7 @@ int run_attention_battery() {
         return 82;
     }
 
-    // A25 independent-head vector family. Its BF16 partition numerators are
+    // Independent-head vector family. Its BF16 partition numerators are
     // intentionally not bit-identical to the permanent float-record path, so
     // compare the final gated BF16 vectors under the frozen numerical band.
     constexpr float kVectorMaximumAbsoluteError = 0.015625f;

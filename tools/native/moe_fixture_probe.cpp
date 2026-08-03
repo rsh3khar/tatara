@@ -602,7 +602,7 @@ int run_moe_battery() {
     const auto select_exps = download<float>(*dev_sel_exp_o.buffer, select_exp_count);
     const std::span<const float> chained_exps(select_exps.data(), kRouterRows);
     const std::span<const float> tie_exps(select_exps.data() + kRouterRows, kRouterRows);
-    // Round-1 division queries (TATARA-EXEC4-DIV1): each exponential against
+    // Round-1 division queries: each exponential against
     // the tree sum, for the chained and tie logits.
     std::vector<float> divide1_numerators, divide1_denominators;
     {

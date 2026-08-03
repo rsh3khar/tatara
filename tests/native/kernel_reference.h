@@ -229,7 +229,7 @@ struct MoeGeometry {
 inline constexpr std::uint32_t kMoeSentinelId = 0xffffffffu;
 
 // f32 division on the device is a reciprocal-refinement class operation
-// (labeled decision TATARA-EXEC4-DIV1): the oracle consumes point-queried
+// (labeled decision ): the oracle consumes point-queried
 // quotients everywhere, and these candidates stand as evidence.
 enum class DivisionModel : std::uint8_t { IeeeDivision, ReciprocalMultiply };
 

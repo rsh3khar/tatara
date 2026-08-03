@@ -8,7 +8,7 @@ namespace {
 using model::PreparedCheckpointIdentityError;
 
 // This is an intentionally conservative lower bound, not the complete capacity
-// model VISION.md promises. If even this lower bound exceeds memory, refusal is
+// model. If even this lower bound exceeds memory, refusal is
 // sound. Passing it is not evidence that the configured slots/context fit.
 constexpr double kProvisionalStateAndScratchFactor = 1.18;
 constexpr std::uint64_t kOperatingSystemHeadroomBytes = 6ull * 1024 * 1024 * 1024;

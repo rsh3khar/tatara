@@ -50,6 +50,7 @@ struct SpeculativeState {
     const MetalLibrary* library{nullptr};
     const MetalCommandQueue* queue{nullptr};
     DecodeStep* decode{nullptr};
+    runtime::DecodeStateSlot* slot{nullptr};
     std::uint32_t context_capacity{0};
 
     DraftCheckpointLoad draft_load;
@@ -80,8 +81,9 @@ SpeculativeError run_verify_band(SpeculativeState& state,
                                  std::span<const std::uint32_t> ids) {
     PrefillStep& prefill = *state.verify;
     DecodeStep& decode = *state.decode;
-    const auto begun = begin_prefill_progress(prefill, decode, context_base,
-                                              context_base, ids);
+    const auto begun = begin_prefill_progress(prefill, decode, *state.slot,
+                                              context_base, context_base,
+                                              ids);
     if (!begun) {
         return SpeculativeError::CommandFailed;
     }
@@ -97,7 +99,7 @@ SpeculativeError run_verify_band(SpeculativeState& state,
             return SpeculativeError::CommandFailed;
         }
         const auto encoded = encode_prefill_units(
-            prefill, decode, decode.state, *pass.compute_pass,
+            prefill, decode, *state.slot, *pass.compute_pass,
             segment.units);
         if (!encoded) {
             return SpeculativeError::CommandFailed;
@@ -135,7 +137,8 @@ SpeculativeError run_verify_band(SpeculativeState& state,
             !wait_until_completed(std::move(*pending.pending_execution))) {
             return SpeculativeError::CommandFailed;
         }
-        const auto committed_units = commit_prefill_units(prefill, decode);
+        const auto committed_units =
+            commit_prefill_units(prefill, decode, *state.slot);
         if (!committed_units) {
             return SpeculativeError::CommandFailed;
         }
@@ -515,7 +518,7 @@ SpeculativeError tape_rollback(SpeculativeState& state,
                                const GdnSnapshot& pre_verify,
                                std::uint32_t committed) {
     DecodeStep& step = *state.decode;
-    restore_gdn(step, pre_verify);
+    restore_gdn(step, *state.slot, pre_verify);
     auto command_buffer = create_command_buffer(*state.queue);
     if (!command_buffer) {
         return SpeculativeError::CommandFailed;
@@ -532,7 +535,7 @@ SpeculativeError tape_rollback(SpeculativeState& state,
         if (step.schedule[l] != model::qwen36::LayerKind::GatedDelta) {
             continue;
         }
-        auto& layer_state = step.state.layers[l];
+        auto& layer_state = state.slot->layers[l];
         MetalBuffer& recurrent_in = layer_state.swapped
                                         ? layer_state.second_out
                                         : layer_state.second;
@@ -567,7 +570,7 @@ SpeculativeError tape_rollback(SpeculativeState& state,
         if (step.schedule[l] != model::qwen36::LayerKind::GatedDelta) {
             continue;
         }
-        auto& layer_state = step.state.layers[l];
+        auto& layer_state = state.slot->layers[l];
         MetalBuffer& conv_out = layer_state.swapped ? layer_state.first
                                                     : layer_state.first_out;
         if (copy_buffer(*blit.blit_pass,
@@ -589,7 +592,7 @@ SpeculativeError tape_rollback(SpeculativeState& state,
     }
     for (std::size_t l = 0; l < step.schedule.size(); ++l) {
         if (step.schedule[l] == model::qwen36::LayerKind::GatedDelta) {
-            step.state.layers[l].swapped = !step.state.layers[l].swapped;
+            state.slot->layers[l].swapped = !state.slot->layers[l].swapped;
         }
     }
     return SpeculativeError::None;
@@ -621,6 +624,7 @@ void SpeculativeEngine::reset_request() {
 SpeculativeEngineResult create_speculative_engine(
     const MetalDevice& device, const MetalLibrary& library,
     const MetalCommandQueue& queue, DecodeStep& decode,
+    runtime::DecodeStateSlot* slot,
     std::uint32_t context_capacity, std::string_view draft_checkpoint_root) {
     SpeculativeEngineResult result;
     auto engine =
@@ -630,6 +634,7 @@ SpeculativeEngineResult create_speculative_engine(
     state.library = &library;
     state.queue = &queue;
     state.decode = &decode;
+    state.slot = slot != nullptr ? slot : &decode.state;
     state.context_capacity = context_capacity;
 
     state.draft_load = load_draft_checkpoint(draft_checkpoint_root);
@@ -652,7 +657,7 @@ SpeculativeEngineResult create_speculative_engine(
         }
         state.draft.pipelines.emplace(name, std::move(*pipeline.pipeline));
     }
-    for (const auto& [name, slot] :
+    for (const auto& [name, target] :
          std::initializer_list<std::pair<std::string_view,
                                          MetalComputePipeline*>>{
              {"native_dense_qgemm_q4_bf16_n1", &state.n1_head},
@@ -666,7 +671,7 @@ SpeculativeEngineResult create_speculative_engine(
             result.error = SpeculativeError::PipelineUnavailable;
             return result;
         }
-        *slot = std::move(*pipeline.pipeline);
+        *target = std::move(*pipeline.pipeline);
     }
 
     PipelineResult verify_pipelines =
@@ -884,9 +889,9 @@ SpeculativeStepResult SpeculativeEngine::step(std::uint32_t staged,
         }
     }
 
-    GdnSnapshot pre_verify = snapshot_gdn(decode);
+    GdnSnapshot pre_verify = snapshot_gdn(decode, *state.slot);
     const auto fail_restored = [&](SpeculativeError error) {
-        restore_gdn(decode, pre_verify);
+        restore_gdn(decode, *state.slot, pre_verify);
         result.error = error;
         return result;
     };

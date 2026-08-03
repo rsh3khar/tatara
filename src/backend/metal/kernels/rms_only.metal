@@ -1,7 +1,7 @@
 // Two-stage simdgroup reduction derived from MLX (Apple Inc., MIT)
 // rms_norm.metal, rms_single_row. The bfloat specialization and the
 // double-rounding output contract below are Tatara's own.
-// See THIRD_PARTY_NOTICES.md and docs/design/PROVENANCE.md.
+// See NOTICE and THIRD_PARTY_LICENSES/.
 kernel void rms_only(device const bfloat* input [[buffer(0)]],
                      device const bfloat* weight [[buffer(1)]], device bfloat* output [[buffer(2)]],
                      uint thread_in_group [[thread_position_in_threadgroup]],
@@ -39,4 +39,49 @@ kernel void rms_only(device const bfloat* input [[buffer(0)]],
         // bfloat16 weight multiply; both roundings are load-bearing.
         output[element] = weight[element] * static_cast<bfloat>(float(input[element]) * inverse);
     }
+}
+
+kernel void rms_only_ms(device const bfloat* input [[buffer(0)]],
+                        device const bfloat* weight [[buffer(1)]],
+                        device bfloat* output [[buffer(2)]],
+                        constant uint& in_stride [[buffer(3)]],
+                        constant uint& out_stride [[buffer(4)]],
+                        uint2 tg [[threadgroup_position_in_grid]],
+                        uint2 thread_in_group2 [[thread_position_in_threadgroup]],
+                        uint lane [[thread_index_in_simdgroup]],
+                        uint simdgroup [[simdgroup_index_in_threadgroup]]) {
+    const uint thread_in_group = thread_in_group2.x;
+    device const bfloat* in_row = input + ulong(tg.y) * in_stride;
+    device bfloat* out_row = output + ulong(tg.y) * out_stride;
+    threadgroup float inverse_norm[1];
+    threadgroup float stage[32];
+    const uint base = thread_in_group * kRmsValuesPerThread;
+    float sum = 0.0f;
+    for (uint i = 0u; i < kRmsValuesPerThread; ++i) {
+        const float value = float(in_row[base + i]);
+        sum += value * value;
+    }
+    sum = simd_sum(sum);
+    if (simdgroup == 0u) {
+        stage[lane] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 0u) {
+        stage[simdgroup] = sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simdgroup == 0u) {
+        sum = simd_sum(stage[lane]);
+        if (lane == 0u) {
+            inverse_norm[0] = precise::rsqrt(sum / float(kHiddenDimension) + kRmsNormEpsilon);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float inverse = inverse_norm[0];
+    for (uint i = 0u; i < kRmsValuesPerThread; ++i) {
+        const uint element = base + i;
+        output[ulong(tg.y) * out_stride + element] =
+            weight[element] * static_cast<bfloat>(float(in_row[element]) * inverse);
+    }
+    (void)out_row;
 }

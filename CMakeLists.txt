@@ -373,6 +373,7 @@ target_link_libraries(tatara_model_load_probe PRIVATE tatara_metal tatara_model_
 tatara_enable_warnings(tatara_model_load_probe)
 
 add_executable(tatara_prefill_library_probe tools/native/prefill_library_probe.cpp)
+
 add_dependencies(
     tatara_prefill_library_probe
     tatara_generated_kernel_library
@@ -927,3 +928,4 @@ if(BUILD_TESTING)
         NAME tatara.completion_request
         COMMAND tatara_completion_request_test)
 endif()
+

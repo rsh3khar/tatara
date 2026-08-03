@@ -25,7 +25,7 @@ using tatara::model::qwen36::LayerKind;
 
 // The sealed reference exam (reference.toml [token]): after the 3,926-token
 // prompt — 3,925 tokens prefilled into the sealed state record plus the
-// pending prompt token 321 — the champion continues with exactly these ids.
+// pending prompt token 321 — the reference engine continues with exactly these ids.
 constexpr std::uint32_t kPendingToken = 321;
 constexpr std::uint32_t kPrefilledTokens = 3925;
 constexpr std::uint32_t kExpectedIds[16] = {4072, 279,  271, 248068, 198, 8160, 579, 264,

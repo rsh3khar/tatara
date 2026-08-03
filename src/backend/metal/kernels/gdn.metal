@@ -224,3 +224,364 @@ kernel void gdn_outproj(device const bfloat* input [[buffer(0)]],
         output[row] = static_cast<bfloat>(acc);
     }
 }
+
+// Row-batched gdn_prepare over pooled conv state: grid y is the batch row,
+// state_table carries per-row {conv_in, conv_out} element offsets into the
+// shared conv pool. Each row's arithmetic is exactly gdn_prepare's.
+kernel void gdn_prepare_ms(device const bfloat* projection [[buffer(0)]],
+                           device bfloat* conv_pool [[buffer(1)]],
+                           device const bfloat* conv_weights [[buffer(2)]],
+                           device bfloat* qk [[buffer(3)]],
+                           device bfloat* value_out [[buffer(4)]],
+                           device bfloat* gate_out [[buffer(5)]],
+                           device const uint* state_table [[buffer(6)]],
+                           constant uint& projection_stride [[buffer(7)]],
+                           constant uint& qk_stride [[buffer(8)]],
+                           constant uint& value_stride [[buffer(9)]],
+                           constant uint& gate_stride [[buffer(10)]],
+                           uint2 tg2 [[threadgroup_position_in_grid]],
+                           uint2 lane2 [[thread_position_in_threadgroup]]) {
+    const uint tg = tg2.x;
+    const uint lane = lane2.x;
+    const uint row = tg2.y;
+    device const bfloat* proj_row = projection + ulong(row) * ulong(projection_stride);
+    device const bfloat* conv_state = conv_pool + state_table[row * 4u];
+    device bfloat* new_conv_state = conv_pool + state_table[row * 4u + 1u];
+    device bfloat* qk_row = qk + ulong(row) * ulong(qk_stride);
+    device bfloat* value_row = value_out + ulong(row) * ulong(value_stride);
+    device bfloat* gate_row = gate_out + ulong(row) * ulong(gate_stride);
+    threadgroup float activation[128];
+    threadgroup float inverse_shared[1];
+    if (tg < kGdnConvChannels / 128u) {
+        const uint channel = tg * 128u + lane;
+        const float x0 = float(conv_state[channel]);
+        const float x1 = float(conv_state[kGdnConvChannels + channel]);
+        const float x2 = float(conv_state[2u * kGdnConvChannels + channel]);
+        const float x3 = float(proj_row[channel]);
+        const ulong weight_base = ulong(channel) * 4ul;
+        const float convolved = float(conv_weights[weight_base]) * x0 +
+                                float(conv_weights[weight_base + 1ul]) * x1 +
+                                float(conv_weights[weight_base + 2ul]) * x2 +
+                                float(conv_weights[weight_base + 3ul]) * x3;
+        const bfloat convolved_b = static_cast<bfloat>(convolved);
+        const bfloat exp_b = static_cast<bfloat>(exp(fabs(float(convolved_b))));
+        const bfloat sig_low = bfloat(1.0f) / (bfloat(1.0f) + exp_b);
+        const bfloat sigmoid_b =
+            float(convolved_b) < 0.0f ? sig_low : static_cast<bfloat>(bfloat(1.0f) - sig_low);
+        const bfloat activated_b = convolved_b * sigmoid_b;
+        new_conv_state[channel] = static_cast<bfloat>(x1);
+        new_conv_state[kGdnConvChannels + channel] = static_cast<bfloat>(x2);
+        new_conv_state[2u * kGdnConvChannels + channel] = static_cast<bfloat>(x3);
+        if (tg < kGdnQkValues / 128u) {
+            activation[lane] = float(activated_b);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (lane < 32u) {
+                const uint base = lane * 4u;
+                float acc = 0.0f;
+                for (uint i = 0; i < 4u; ++i) {
+                    const float value = activation[base + i];
+                    acc += value * value;
+                }
+                acc = simd_sum(acc);
+                if (lane == 0u) {
+                    inverse_shared[0] =
+                        precise::rsqrt(acc / float(kGdnHeadDimension) + kRmsNormEpsilon);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const bfloat normed = static_cast<bfloat>(activation[lane] * inverse_shared[0]);
+            const bfloat scale_b =
+                tg < kGdnKeyHeads ? bfloat(kGdnQueryScale) : bfloat(kGdnKeyScale);
+            qk_row[channel] = normed * scale_b;
+        } else {
+            value_row[channel - kGdnQkValues] = activated_b;
+        }
+    } else {
+        const uint index = (tg - kGdnConvChannels / 128u) * 128u + lane;
+        gate_row[index] = proj_row[kGdnQkvRows + index];
+    }
+}
+
+// Row-batched gdn_recurrence over pooled recurrent state: batch rows fold
+// into grid z (z = row * value_heads + value_head), state_table carries
+// per-row {rec_in, rec_out} float-element offsets into the shared pool.
+// Each row's floating-point sequence is exactly gdn_recurrence's.
+kernel void
+gdn_recurrence_ms(device const bfloat* qk [[buffer(0)]],
+                  device const bfloat* value [[buffer(1)]],
+                  device const bfloat* projection [[buffer(2)]],
+                  device const bfloat* a_log [[buffer(3)]],
+                  device const bfloat* dt_bias [[buffer(4)]],
+                  device float* rec_pool [[buffer(5)]],
+                  device bfloat* output [[buffer(6)]],
+                  device const uint* state_table [[buffer(7)]],
+                  constant uint& qk_stride [[buffer(8)]],
+                  constant uint& value_stride [[buffer(9)]],
+                  constant uint& projection_stride [[buffer(10)]],
+                  constant uint& output_stride [[buffer(11)]],
+                  constant uint& value_heads [[buffer(12)]],
+                  uint3 position [[thread_position_in_grid]],
+                  uint lane [[thread_index_in_simdgroup]]) {
+    const uint row = position.z / value_heads;
+    const uint value_head = position.z % value_heads;
+    const uint value_dim = position.y;
+    const uint key_head = value_head >> 1u;
+    const uint query_base = key_head * kGdnHeadDimension;
+    const uint key_base = kGdnKOffset + query_base;
+    const ulong state_base = (ulong(value_head) * ulong(kGdnHeadDimension) + ulong(value_dim)) *
+                             ulong(kGdnHeadDimension);
+    device const bfloat* qk_row = qk + ulong(row) * ulong(qk_stride);
+    device const bfloat* value_row = value + ulong(row) * ulong(value_stride);
+    device const bfloat* proj_row = projection + ulong(row) * ulong(projection_stride);
+    device const float* state_in = rec_pool + state_table[row * 4u + 2u];
+    device float* state_out = rec_pool + state_table[row * 4u + 3u];
+    device bfloat* out_row = output + ulong(row) * ulong(output_stride);
+    const bfloat a_b = proj_row[kGdnARowOffset + value_head];
+    const bfloat b_b = proj_row[kGdnBRowOffset + value_head];
+    const bfloat shifted = a_b + dt_bias[value_head];
+    const bfloat branch_max = float(shifted) > 0.0f ? shifted : bfloat(0.0f);
+    const bfloat branch_min = float(shifted) > 0.0f ? bfloat(0.0f) : shifted;
+    const bfloat difference = branch_min - branch_max;
+    const bfloat exp_b = static_cast<bfloat>(exp(float(difference)));
+    const float one_plus = 1.0f + float(exp_b);
+    const bfloat log1p_b =
+        (one_plus == 1.0f)
+            ? exp_b
+            : static_cast<bfloat>(float(exp_b) * (log(one_plus) / (one_plus - 1.0f)));
+    const bfloat softplus_b = branch_max + log1p_b;
+    const float decay = exp(-exp(float(a_log[value_head])) * float(softplus_b));
+    const bfloat beta_exp = static_cast<bfloat>(exp(fabs(float(b_b))));
+    const bfloat beta_low = bfloat(1.0f) / (bfloat(1.0f) + beta_exp);
+    const float beta =
+        float(b_b) < 0.0f ? float(beta_low) : float(static_cast<bfloat>(bfloat(1.0f) - beta_low));
+    float state[4];
+    float key_value = 0.0f;
+    for (uint i = 0; i < 4u; ++i) {
+        const uint element = lane * 4u + i;
+        state[i] = state_in[state_base + element] * decay;
+        key_value += state[i] * float(qk_row[key_base + element]);
+    }
+    key_value = simd_sum(key_value);
+    const float delta =
+        (float(value_row[value_head * kGdnHeadDimension + value_dim]) - key_value) * beta;
+    float out = 0.0f;
+    for (uint i = 0; i < 4u; ++i) {
+        const uint element = lane * 4u + i;
+        state[i] += float(qk_row[key_base + element]) * delta;
+        state_out[state_base + element] = state[i];
+        out += state[i] * float(qk_row[query_base + element]);
+    }
+    out = simd_sum(out);
+    if (lane == 0u) {
+        out_row[value_head * kGdnHeadDimension + value_dim] = static_cast<bfloat>(out);
+    }
+}
+
+kernel void gdn_project_ms(
+    device const bfloat* input [[buffer(0)]], device const uint* qkv_words [[buffer(1)]],
+    device const bfloat* qkv_scales [[buffer(2)]], device const bfloat* qkv_biases [[buffer(3)]],
+    device const uint* z_words [[buffer(4)]], device const bfloat* z_scales [[buffer(5)]],
+    device const bfloat* z_biases [[buffer(6)]], device const uint* b_words [[buffer(7)]],
+    device const bfloat* b_scales [[buffer(8)]], device const bfloat* b_biases [[buffer(9)]],
+    device const uint* a_words [[buffer(10)]], device const bfloat* a_scales [[buffer(11)]],
+    device const bfloat* a_biases [[buffer(12)]], device bfloat* projection [[buffer(13)]],
+    constant uint& row_count [[buffer(14)]], constant uint& row_tile [[buffer(15)]],
+    uint2 tid2 [[thread_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    const uint row = tid2.x >> 5u;
+    const uint row_base = tid2.y * row_tile;
+    if (row >= kGdnProjectionRows || row_base >= row_count) {
+        return;
+    }
+    const uint tile_rows = min(row_tile, row_count - row_base);
+    device const uint* words;
+    device const bfloat* scales;
+    device const bfloat* biases;
+    uint local_row;
+    if (row < kGdnQkvRows) {
+        words = qkv_words;
+        scales = qkv_scales;
+        biases = qkv_biases;
+        local_row = row;
+    } else if (row < kGdnQkvRows + kGdnZRows) {
+        words = z_words;
+        scales = z_scales;
+        biases = z_biases;
+        local_row = row - kGdnQkvRows;
+    } else if (row < kGdnBRowOffset + kGdnValueHeads) {
+        words = b_words;
+        scales = b_scales;
+        biases = b_biases;
+        local_row = row - kGdnBRowOffset;
+    } else {
+        words = a_words;
+        scales = a_scales;
+        biases = a_biases;
+        local_row = row - kGdnARowOffset;
+    }
+    const ulong word_row = ulong(local_row) * ulong(kQuantWordsPerRow);
+    const ulong group_row = ulong(local_row) * ulong(kGroupsPerRow);
+    float batch[kQ4BatchRowsMax];
+    q4_dot_ms(input + ulong(row_base) * ulong(kHiddenDimension), ulong(kHiddenDimension),
+              tile_rows, words + word_row, scales + group_row, biases + group_row,
+              kHiddenDimension, lane, batch);
+    if (lane == 0u) {
+        for (uint r = 0u; r < tile_rows; ++r) {
+            projection[ulong(row_base + r) * ulong(kGdnProjectionRows) + row] =
+                static_cast<bfloat>(batch[r]);
+        }
+    }
+}
+
+kernel void gdn_project_ms_v2(
+    device const bfloat* input [[buffer(0)]], device const uint* qkv_words [[buffer(1)]],
+    device const bfloat* qkv_scales [[buffer(2)]], device const bfloat* qkv_biases [[buffer(3)]],
+    device const uint* z_words [[buffer(4)]], device const bfloat* z_scales [[buffer(5)]],
+    device const bfloat* z_biases [[buffer(6)]], device const uint* b_words [[buffer(7)]],
+    device const bfloat* b_scales [[buffer(8)]], device const bfloat* b_biases [[buffer(9)]],
+    device const uint* a_words [[buffer(10)]], device const bfloat* a_scales [[buffer(11)]],
+    device const bfloat* a_biases [[buffer(12)]], device bfloat* projection [[buffer(13)]],
+    constant uint& row_count [[buffer(14)]], constant uint& row_tile [[buffer(15)]],
+    uint2 tid2 [[thread_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    const uint row = tid2.x >> 5u;
+    const uint row_base = tid2.y * row_tile;
+    if (row >= kGdnProjectionRows || row_base >= row_count) {
+        return;
+    }
+    const uint tile_rows = min(row_tile, row_count - row_base);
+    device const uint* words;
+    device const bfloat* scales;
+    device const bfloat* biases;
+    uint local_row;
+    if (row < kGdnQkvRows) {
+        words = qkv_words;
+        scales = qkv_scales;
+        biases = qkv_biases;
+        local_row = row;
+    } else if (row < kGdnQkvRows + kGdnZRows) {
+        words = z_words;
+        scales = z_scales;
+        biases = z_biases;
+        local_row = row - kGdnQkvRows;
+    } else if (row < kGdnBRowOffset + kGdnValueHeads) {
+        words = b_words;
+        scales = b_scales;
+        biases = b_biases;
+        local_row = row - kGdnBRowOffset;
+    } else {
+        words = a_words;
+        scales = a_scales;
+        biases = a_biases;
+        local_row = row - kGdnARowOffset;
+    }
+    const ulong word_row = ulong(local_row) * ulong(kQuantWordsPerRow);
+    const ulong group_row = ulong(local_row) * ulong(kGroupsPerRow);
+    float batch[kQ4BatchRowsMax];
+    q4_dot_ms_v2(input + ulong(row_base) * ulong(kHiddenDimension), ulong(kHiddenDimension),
+              tile_rows, words + word_row, scales + group_row, biases + group_row,
+              kHiddenDimension, lane, batch);
+    if (lane == 0u) {
+        for (uint r = 0u; r < tile_rows; ++r) {
+            projection[ulong(row_base + r) * ulong(kGdnProjectionRows) + row] =
+                static_cast<bfloat>(batch[r]);
+        }
+    }
+}
+
+kernel void gdn_outproj_ms(device const bfloat* input [[buffer(0)]],
+                           device const uint* words [[buffer(1)]],
+                           device const bfloat* scales [[buffer(2)]],
+                           device const bfloat* biases [[buffer(3)]],
+                           device bfloat* output [[buffer(4)]],
+                           constant uint& row_count [[buffer(5)]],
+                           constant uint& output_stride [[buffer(6)]],
+                           constant uint& row_tile [[buffer(7)]],
+                           uint2 tid2 [[thread_position_in_grid]],
+                           uint lane [[thread_index_in_simdgroup]]) {
+    const uint row = tid2.x >> 5u;
+    const uint row_base = tid2.y * row_tile;
+    if (row >= kHiddenDimension || row_base >= row_count) {
+        return;
+    }
+    const uint tile_rows = min(row_tile, row_count - row_base);
+    const ulong word_row = ulong(row) * ulong(kGdnValueValues / 8u);
+    const ulong group_row = ulong(row) * ulong(kGdnValueValues / kQ4GroupSize);
+    float batch[kQ4BatchRowsMax];
+    q4_dot_ms(input + ulong(row_base) * ulong(kGdnValueValues), ulong(kGdnValueValues),
+              tile_rows, words + word_row, scales + group_row, biases + group_row,
+              kGdnValueValues, lane, batch);
+    if (lane == 0u) {
+        for (uint r = 0u; r < tile_rows; ++r) {
+            output[ulong(row_base + r) * ulong(output_stride) + row] =
+                static_cast<bfloat>(batch[r]);
+        }
+    }
+}
+
+kernel void gdn_outproj_ms_v2(device const bfloat* input [[buffer(0)]],
+                           device const uint* words [[buffer(1)]],
+                           device const bfloat* scales [[buffer(2)]],
+                           device const bfloat* biases [[buffer(3)]],
+                           device bfloat* output [[buffer(4)]],
+                           constant uint& row_count [[buffer(5)]],
+                           constant uint& output_stride [[buffer(6)]],
+                           constant uint& row_tile [[buffer(7)]],
+                           uint2 tid2 [[thread_position_in_grid]],
+                           uint lane [[thread_index_in_simdgroup]]) {
+    const uint row = tid2.x >> 5u;
+    const uint row_base = tid2.y * row_tile;
+    if (row >= kHiddenDimension || row_base >= row_count) {
+        return;
+    }
+    const uint tile_rows = min(row_tile, row_count - row_base);
+    const ulong word_row = ulong(row) * ulong(kGdnValueValues / 8u);
+    const ulong group_row = ulong(row) * ulong(kGdnValueValues / kQ4GroupSize);
+    float batch[kQ4BatchRowsMax];
+    q4_dot_ms_v2(input + ulong(row_base) * ulong(kGdnValueValues), ulong(kGdnValueValues),
+              tile_rows, words + word_row, scales + group_row, biases + group_row,
+              kGdnValueValues, lane, batch);
+    if (lane == 0u) {
+        for (uint r = 0u; r < tile_rows; ++r) {
+            output[ulong(row_base + r) * ulong(output_stride) + row] =
+                static_cast<bfloat>(batch[r]);
+        }
+    }
+}
+
+kernel void gdn_gate_norm_ms(device const bfloat* recurrence_out [[buffer(0)]],
+                             device const bfloat* gate [[buffer(1)]],
+                             device const bfloat* weight [[buffer(2)]],
+                             device bfloat* output [[buffer(3)]],
+                             constant uint& value_stride [[buffer(4)]],
+                             uint2 tg [[threadgroup_position_in_grid]],
+                             uint2 lane2 [[thread_position_in_threadgroup]]) {
+    const uint lane = lane2.x;
+    device const bfloat* rec_row = recurrence_out + ulong(tg.y) * value_stride;
+    device const bfloat* gate_row = gate + ulong(tg.y) * value_stride;
+    device bfloat* out_row = output + ulong(tg.y) * value_stride;
+    threadgroup float head_values[128];
+    threadgroup float inverse_shared[1];
+    const uint index = tg.x * 128u + lane;
+    head_values[lane] = float(rec_row[index]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane < 32u) {
+        const uint base = lane * 4u;
+        float acc = 0.0f;
+        for (uint i = 0; i < 4u; ++i) {
+            const float value = head_values[base + i];
+            acc += value * value;
+        }
+        acc = simd_sum(acc);
+        if (lane == 0u) {
+            inverse_shared[0] = precise::rsqrt(acc / float(kGdnHeadDimension) + kRmsNormEpsilon);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const bfloat normed_b =
+        weight[lane] * static_cast<bfloat>(head_values[lane] * inverse_shared[0]);
+    const float gate_value = float(gate_row[index]);
+    const float sig_low = 1.0f / (1.0f + exp(fabs(gate_value)));
+    const float sigmoid_value = gate_value < 0.0f ? sig_low : 1.0f - sig_low;
+    out_row[index] = static_cast<bfloat>((gate_value * sigmoid_value) * float(normed_b));
+}

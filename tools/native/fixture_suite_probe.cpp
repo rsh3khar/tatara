@@ -5,10 +5,10 @@
 #include <string_view>
 
 // Safe-math fixture suite (seventh boundary contract,
-// docs/design/COMPONENT_EXECUTION.md).
+// the component execution contract).
 //
 // Re-derives the EXEC1-EXEC5 semantics bank against the library that actually
-// ships. TATARA-EXEC6-MATH1 established that every adjudication earned before
+// ships. established that every adjudication earned before
 // it is a property of the fast-math library: a fixture compares a kernel
 // against an observation kernel from the same library, so both move together
 // under either math mode and agree. The bank is therefore not wrong so much as
@@ -107,7 +107,7 @@ void print_rule() {
 
 int main() {
     std::cout << "safe-math fixture suite: re-deriving the EXEC1-EXEC5 semantics bank\n"
-              << "compilation mode: MTLMathModeSafe (TATARA-EXEC6-MATH1)\n"
+              << "compilation mode: MTLMathModeSafe\n"
               << "batteries: 6, independent, continue-on-mismatch\n";
 
     int results[std::size(kBatteries)] = {};

@@ -262,4 +262,69 @@ MetalBufferResult create_buffer_window(const MetalBuffer& buffer,
     }
 }
 
+MetalPooledBufferResult create_striped_pool_buffer(const MetalDevice& device,
+                                                   std::uint64_t stripe_bytes,
+                                                   std::uint32_t stripe_count) {
+    if (!device) {
+        return {.error = MetalResourceError::InvalidDevice,
+                .buffer = std::nullopt,
+                .stripe_stride_bytes = 0};
+    }
+    if (stripe_bytes == 0 || stripe_count == 0) {
+        return {.error = MetalResourceError::InvalidBufferSize,
+                .buffer = std::nullopt,
+                .stripe_stride_bytes = 0};
+    }
+    @autoreleasepool {
+        id<MTLDevice> native_device = (__bridge id<MTLDevice>)device.storage_->object.get();
+        const MTLSizeAndAlign stripe_extent = [native_device
+            heapBufferSizeAndAlignWithLength:static_cast<NSUInteger>(stripe_bytes)
+                                     options:MTLResourceStorageModeShared];
+        std::uint64_t stride = stripe_extent.size;
+        if (stripe_extent.align != 0 && stride % stripe_extent.align != 0) {
+            stride += stripe_extent.align - stride % stripe_extent.align;
+        }
+        if (stride == 0 ||
+            stride > std::numeric_limits<NSUInteger>::max() / stripe_count) {
+            return {.error = MetalResourceError::InvalidBufferSize,
+                    .buffer = std::nullopt,
+                    .stripe_stride_bytes = 0};
+        }
+        const std::uint64_t total_bytes = stride * stripe_count;
+        MTLHeapDescriptor* heap_descriptor = [MTLHeapDescriptor new];
+        heap_descriptor.type = MTLHeapTypePlacement;
+        heap_descriptor.storageMode = MTLStorageModeShared;
+        heap_descriptor.hazardTrackingMode = MTLHazardTrackingModeTracked;
+        heap_descriptor.size = static_cast<NSUInteger>(total_bytes);
+        id<MTLHeap> heap = [native_device newHeapWithDescriptor:heap_descriptor];
+        if (heap == nil) {
+            return {.error = MetalResourceError::BufferCreationFailed,
+                    .buffer = std::nullopt,
+                    .stripe_stride_bytes = 0};
+        }
+        id<MTLBuffer> buffer = [heap newBufferWithLength:static_cast<NSUInteger>(total_bytes)
+                                                 options:MTLResourceStorageModeShared
+                                                  offset:0];
+        if (buffer == nil || buffer.length != static_cast<NSUInteger>(total_bytes) ||
+            buffer.storageMode != MTLStorageModeShared) {
+            return {.error = MetalResourceError::BufferCreationFailed,
+                    .buffer = std::nullopt,
+                    .stripe_stride_bytes = 0};
+        }
+        auto owner = retain_object(buffer);
+        if (!owner) {
+            return {.error = MetalResourceError::OwnershipFailure,
+                    .buffer = std::nullopt,
+                    .stripe_stride_bytes = 0};
+        }
+        auto storage = std::make_unique<MetalBuffer::Storage>();
+        storage->object = std::move(*owner);
+        return {
+            .error = MetalResourceError::None,
+            .buffer = MetalBuffer(std::move(storage), total_bytes),
+            .stripe_stride_bytes = stride,
+        };
+    }
+}
+
 } // namespace tatara::backend::metal

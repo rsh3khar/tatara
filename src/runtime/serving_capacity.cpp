@@ -65,8 +65,16 @@ ServingCapacityCandidate evaluate_serving_capacity_candidate(
     ServingCapacityCandidate result;
     ServingCapacityBreakdown& breakdown = result.breakdown;
     breakdown.context_capacity = context_capacity;
+    breakdown.state_slots =
+        profile.concurrent_state_slots == 0
+            ? 1u
+            : profile.concurrent_state_slots;
     breakdown.prepared_image_bytes = profile.prepared_image_bytes;
-    breakdown.decode_slot_bytes = prefill.slot_state_bytes;
+    if (!scaled(prefill.slot_state_bytes, breakdown.state_slots,
+                breakdown.decode_slot_bytes)) {
+        result.error = ServingCapacityError::ArithmeticOverflow;
+        return result;
+    }
     breakdown.cache_budget_bytes = profile.cache_budget_bytes;
     breakdown.graph_object_budget_bytes =
         profile.graph_object_budget_bytes;

@@ -54,7 +54,7 @@ constexpr std::uint32_t kExpectedProducedIds[15] = {279, 271, 248068, 198, 8160,
                                                     579, 264, 7047,   1817, 25,
                                                     271, 16,  13,     220,  2972};
 
-// The champion's timing protocol, replicated so the two engines' numbers are
+// The reference timing protocol, replicated so the two engines' numbers are
 // read the same way: 21 executions with the first four discarded, then the
 // seventeen survivors sorted, median at index 8, p10 and p90 at 1 and 15.
 constexpr std::size_t kWarmupTokens = 4;
@@ -69,7 +69,7 @@ constexpr std::size_t kHighIndex = kMeasuredTokens - 2;
 constexpr char kRecordMagic[8] = {'Q', '3', '6', 'B', 'R', 'S', '0', '1'};
 
 // One executed token, split so CPU-side cost separates from GPU execution.
-// wall is what the champion's wall_median measures and gpu is what its
+// wall is what the reference wall_median measures and gpu is what its
 // gpu_median measures; schedule is the driver's own window around the
 // submission, which is where resource residency validation lands.
 struct TokenTiming {
@@ -131,7 +131,7 @@ bool parse_score_kernel(
             tatara::tools::DecodeAttentionScoreKernel::Adaptive;
         return true;
     }
-    if (text == "score-adaptive-a23") {
+    if (text == "score-adaptive-fused") {
         score_kernel =
             tatara::tools::DecodeAttentionScoreKernel::AdaptiveA23;
         return true;
@@ -183,7 +183,7 @@ const char* score_kernel_name(
     case tatara::tools::DecodeAttentionScoreKernel::Adaptive:
         return "score-adaptive";
     case tatara::tools::DecodeAttentionScoreKernel::AdaptiveA23:
-        return "score-adaptive-a23";
+        return "score-adaptive-fused";
     case tatara::tools::DecodeAttentionScoreKernel::Gqa4:
         return "score-gqa4";
     case tatara::tools::DecodeAttentionScoreKernel::Gqa4SimdReduce:
@@ -211,7 +211,7 @@ const char* value_kernel_name(
 int main(int argument_count, char** arguments) {
     if (argument_count < 4 || argument_count > 7) {
         std::cerr << "usage: tatara_decode_perf_probe RECORD ARTIFACT_ROOT STATES"
-                     " [FED_TOKEN] [score-adaptive|score-adaptive-a23|score-gqa4|"
+                     " [FED_TOKEN] [score-adaptive|score-adaptive-fused|score-gqa4|"
                      "score-gqa4-simdreduce|score-gqa8|"
                      "score-value-gqa8-fused|score-vector-2pass]"
                      " [value-t1024|value-t512]\n";
@@ -455,7 +455,7 @@ int main(int argument_count, char** arguments) {
     // Partial coverage is a typed failure, not a footnote. Substituting wall
     // time for a missing sample and still calling the result gpu_median
     // produces a blended number wearing a GPU label, which is then compared
-    // against the champion's genuine gpu_median -- a silent fallback that
+    // against the reference genuine gpu_median -- a silent fallback that
     // rescues a measurement rather than reporting it failed. Anything short of
     // full coverage exits nonzero.
     if (gpu_samples != kMeasuredTokens) {

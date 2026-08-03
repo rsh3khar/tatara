@@ -51,11 +51,14 @@ struct SpeculativeEngineResult {
     }
 };
 
+// slot selects the persistent state the engine drafts against and rolls
+// back; null binds the step's primary slot (the single-stream default).
 SpeculativeEngineResult create_speculative_engine(
     const backend::metal::MetalDevice& device,
     const backend::metal::MetalLibrary& library,
     const backend::metal::MetalCommandQueue& queue,
-    runtime::DecodeStep& decode, std::uint32_t context_capacity,
+    runtime::DecodeStep& decode, runtime::DecodeStateSlot* slot,
+    std::uint32_t context_capacity,
     std::string_view draft_checkpoint_root);
 
 class SpeculativeEngine {
@@ -84,7 +87,7 @@ class SpeculativeEngine {
         const backend::metal::MetalDevice&,
         const backend::metal::MetalLibrary&,
         const backend::metal::MetalCommandQueue&, runtime::DecodeStep&,
-        std::uint32_t, std::string_view);
+        runtime::DecodeStateSlot*, std::uint32_t, std::string_view);
     SpeculativeEngine();
     std::unique_ptr<detail::SpeculativeState> state_;
 };

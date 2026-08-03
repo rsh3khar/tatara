@@ -8,7 +8,7 @@
 
 namespace tatara::service {
 
-// The five outcomes VISION.md promises for any artifact presented to Tatara.
+// The five outcomes for any artifact presented to Tatara.
 // Closed set: a command that cannot complete its gates reports no verdict at
 // all rather than guessing one.
 enum class Verdict : std::uint8_t {

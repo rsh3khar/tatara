@@ -76,7 +76,7 @@ MetalLibraryResult create_library_with_source(const MetalDevice& device, std::st
         id<MTLDevice> native_device = (__bridge id<MTLDevice>)device.storage_->object.get();
         NSError* error = nil;
         // The sealed arithmetic contract compiles under safe math
-        // (TATARA-EXEC6-MATH1): the champion library sets MTLMathModeSafe,
+        // The reference library sets MTLMathModeSafe,
         // and the fast-math default is a global low-bit divergence that
         // self-consistent fixtures cannot see.
         MTLCompileOptions* options = [MTLCompileOptions new];

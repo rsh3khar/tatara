@@ -60,11 +60,18 @@ class Server {
     // Returns whether the connection should stay open.
     bool handle(int descriptor, const struct HttpRequest& request);
 
+    // Worker-thread path for completion routes when the configuration
+    // admits more than one concurrent request: the worker owns the
+    // socket, serves the parsed request, then continues the connection's
+    // keep-alive loop off the poll thread.
+    void serve_on_worker(int descriptor, struct HttpRequest first);
+
     Configuration configuration_;
     ServerHooks hooks_;
     int listener_{-1};
     std::uint16_t port_{0};
     std::atomic<bool> draining_{false};
+    std::atomic<std::uint32_t> active_workers_{0};
 };
 
 } // namespace tatara::service

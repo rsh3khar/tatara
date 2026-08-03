@@ -11,7 +11,7 @@
 namespace tatara::draft {
 
 // Frozen plan of the DFlash draft companion model for the Qwen3.6-35B-A3B
-// target (TATARA-EXACT-SPEC-1, DECODE_SWITCHING_FEASIBILITY.md section 5).
+// target.
 // These are draft-model facts, not target facts; every one of them is
 // verified against the checkpoint inventory at load time, so a checkpoint
 // that disagrees is refused typed rather than silently reinterpreted.

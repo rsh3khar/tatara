@@ -12,13 +12,13 @@ backend::metal::MetalBuffer& plane_recurrent(runtime::DecodeLayerState& state) {
     return state.swapped ? state.second_out : state.second;
 }
 
-GdnSnapshot snapshot_gdn(DecodeStep& step) {
+GdnSnapshot snapshot_gdn(DecodeStep& step, runtime::DecodeStateSlot& slot) {
     GdnSnapshot snapshot;
     for (std::size_t layer = 0; layer < step.schedule.size(); ++layer) {
         if (step.schedule[layer] != model::qwen36::LayerKind::GatedDelta) {
             continue;
         }
-        auto& state = step.state.layers[layer];
+        auto& state = slot.layers[layer];
         std::vector<std::byte> conv(step.geometry.gdn_conv_state_bytes);
         std::vector<std::byte> recurrent(step.geometry.gdn_recurrent_state_bytes);
         std::memcpy(conv.data(), plane_conv(state).contents(), conv.size());
@@ -31,13 +31,14 @@ GdnSnapshot snapshot_gdn(DecodeStep& step) {
     return snapshot;
 }
 
-void restore_gdn(DecodeStep& step, const GdnSnapshot& snapshot) {
+void restore_gdn(DecodeStep& step, runtime::DecodeStateSlot& slot,
+                 const GdnSnapshot& snapshot) {
     std::size_t cursor = 0;
     for (std::size_t layer = 0; layer < step.schedule.size(); ++layer) {
         if (step.schedule[layer] != model::qwen36::LayerKind::GatedDelta) {
             continue;
         }
-        auto& state = step.state.layers[layer];
+        auto& state = slot.layers[layer];
         state.swapped = snapshot.swapped[cursor];
         std::memcpy(plane_conv(state).contents(), snapshot.conv[cursor].data(),
                     snapshot.conv[cursor].size());
