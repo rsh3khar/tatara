@@ -3,8 +3,8 @@
 An inference engine for Qwen3.6-35B-A3B (affine Q4, group 64) on Apple
 silicon, written from scratch in C++ and Metal. One model, compiled into
 the engine as static data. OpenAI-compatible HTTP serving, concurrent
-requests whose outputs are byte-identical to the same prompt served
-alone, and speculative decoding with exact verification.
+requests that generate token for token what the same prompt generates
+served alone, and speculative decoding with exact verification.
 
 ## Requirements
 
@@ -106,11 +106,15 @@ enabled = false
 
 The surface is OpenAI-compatible: `/v1/chat/completions`,
 `/v1/completions` (text or token-id prompts), `/v1/models`,
-`/health/live`, `/health/ready`, `/metrics`. Configuration is
-fail-closed: unknown keys and unsupported combinations refuse at boot
-with named diagnostics. Sampling is greedy: `temperature` and the other
-sampling fields are refused rather than ignored. Output length is
-bounded only by context capacity.
+`/health/live`, `/health/ready`, `/metrics`. Responses carry `id`,
+`created`, `model` and a `finish_reason` of `stop` or `length`;
+streaming ends with a chunk carrying `finish_reason` and then
+`data: [DONE]`. Configuration is fail-closed: unknown keys and
+unsupported combinations refuse at boot with named diagnostics.
+Sampling is greedy: `temperature` and the other sampling fields are
+refused rather than ignored. An empty `tools` array is accepted; a
+populated one is refused, because this engine does not call tools.
+Output length is bounded only by context capacity.
 
 Qwen3.6 reasons before it answers. On `/v1/chat/completions` the
 reasoning is returned separately as `reasoning_content`, and `content`
@@ -176,12 +180,13 @@ machine from a fresh boot):
 | tatara 0.2.0        | 84.4 | 105.2 | 118.3 | 125.2 | 128.9 |
 | mlx_lm.server 0.31.3| 66.9 | 109.1 | 147.7 | 188.6 | 215.5 |
 
-Every tatara response above is byte-identical to the same prompt served
-alone: the concurrency is lossless, gated per release
+Every tatara response above carries exactly the tokens the same prompt
+produces served alone: the concurrency is lossless, gated per release
 (duplicate-identity, isolation, queue bounds, cancellation under load,
-concurrent streaming, and drain under load). Requests beyond
-`max_concurrent_requests` plus `queue_depth` receive 429 rather than
-degrading the streams in flight.
+concurrent streaming, and drain under load). Response envelopes differ
+in the fields that are meant to, such as `id` and `created`. Requests
+beyond `max_concurrent_requests` plus `queue_depth` receive 429 rather
+than degrading the streams in flight.
 
 Speculative decoding (draft block 16, every committed token verified
 against the model): 126 to 142 output tok/s on repetitive and structured

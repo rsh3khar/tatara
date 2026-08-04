@@ -1,4 +1,4 @@
-// DFlash draft-model kernel family (TATARA-EXACT-SPEC-1, A36 U3).
+// DFlash draft-model kernel family.
 //
 // The draft is a 6-layer bf16 dense transformer conditioned on projected
 // target hidden states. Draft numerics can never change committed output —

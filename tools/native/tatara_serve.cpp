@@ -2443,6 +2443,15 @@ int run_serve(std::vector<std::string_view> arguments) {
         bool in_reasoning =
             route == Route::ChatCompletions && request.enable_thinking;
         bool stopped = false;
+        const std::int64_t created_seconds =
+            std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now().time_since_epoch())
+                .count();
+        const std::string completion_id =
+            (route == Route::ChatCompletions ? "chatcmpl-" : "cmpl-") +
+            std::to_string(created_seconds) + "-" +
+            std::to_string(reinterpret_cast<std::uintptr_t>(&generation) &
+                           0xffffffu);
         bool spec_request_active = static_cast<bool>(speculative);
         const bool cache_active = prefix_cache.enabled() &&
                                   !speculative &&
@@ -3258,6 +3267,22 @@ int run_serve(std::vector<std::string_view> arguments) {
                 return false;
             }
         }
+        if (generation.stream) {
+            // Terminal chunk: clients treat a stream without a
+            // finish_reason as truncated.
+            std::ostringstream terminal;
+            terminal << "{\"id\":\"" << json_escape(completion_id)
+                     << "\",\"object\":\""
+                     << (route == Route::ChatCompletions
+                             ? "chat.completion.chunk"
+                             : "text_completion")
+                     << "\",\"created\":" << created_seconds
+                     << ",\"model\":\"" << json_escape(std::string(plan.id))
+                     << "\",\"choices\":[{\"index\":0,\"delta\":{},"
+                        "\"finish_reason\":\""
+                     << (stopped ? "stop" : "length") << "\"}]}";
+            (void)generation.emit(terminal.str());
+        }
         const engine::PrefixCacheTerminalDisposition
             cache_terminal =
                 g_draining.load(std::memory_order_relaxed)
@@ -3280,22 +3305,39 @@ int run_serve(std::vector<std::string_view> arguments) {
             bump(counters.prefix_cache_publications);
         }
 
+        // stopped distinguishes a stop token from the output budget
+        // running out.
+        const char* finish_reason = stopped ? "stop" : "length";
         std::ostringstream out;
         if (request.prompt_kind == PromptKind::TokenIds) {
-            out << "{\"object\":\"text_completion\",\"choices\":[{\"tokens\":[";
+            out << "{\"id\":\"" << json_escape(completion_id)
+                << "\",\"object\":\"text_completion\",\"created\":"
+                << created_seconds << ",\"model\":\""
+                << json_escape(std::string(plan.id))
+                << "\",\"choices\":[{\"index\":0,\"finish_reason\":\""
+                << finish_reason << "\",\"tokens\":[";
             for (std::size_t index = 0; index < produced.size(); ++index) {
                 out << produced[index]
                     << (index + 1 == produced.size() ? "" : ",");
             }
             out << "]}]";
         } else if (route == Route::ChatCompletions) {
-            out << "{\"object\":\"chat.completion\",\"choices\":[{\"index\":0,"
-                   "\"message\":{\"role\":\"assistant\",\"reasoning_content\":\""
+            out << "{\"id\":\"" << json_escape(completion_id)
+                << "\",\"object\":\"chat.completion\",\"created\":"
+                << created_seconds << ",\"model\":\""
+                << json_escape(std::string(plan.id))
+                << "\",\"choices\":[{\"index\":0,\"finish_reason\":\""
+                << finish_reason
+                << "\",\"message\":{\"role\":\"assistant\",\"reasoning_content\":\""
                 << json_escape(reasoning_text) << "\",\"content\":\""
                 << json_escape(completion_text) << "\"}}]";
         } else {
-            out << "{\"object\":\"text_completion\",\"choices\":[{\"index\":0,"
-                   "\"text\":\""
+            out << "{\"id\":\"" << json_escape(completion_id)
+                << "\",\"object\":\"text_completion\",\"created\":"
+                << created_seconds << ",\"model\":\""
+                << json_escape(std::string(plan.id))
+                << "\",\"choices\":[{\"index\":0,\"finish_reason\":\""
+                << finish_reason << "\",\"text\":\""
                 << json_escape(completion_text) << "\"}]";
         }
         out << ",\"usage\":{\"prompt_tokens\":" << prompt.size()

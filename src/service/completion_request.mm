@@ -317,12 +317,31 @@ ParsedCompletionResult parse_completion_request(
                 "model", "prompt", "max_tokens", "stream", "stop_token_ids"};
             const std::vector<std::string_view> chat_keys{
                 "model", "messages", "max_tokens", "stream",
-                "stop_token_ids", "enable_thinking"};
+                "stop_token_ids", "enable_thinking", "tools"};
             const std::optional<std::string> unknown = first_unknown_key(
                 root, route == Route::Completions ? completion_keys : chat_keys);
             if (unknown.has_value()) {
                 return parse_error(CompletionRequestError::UnknownField,
                                    "unsupported request field: " + *unknown);
+            }
+            // Clients commonly send an empty tools array whether or
+            // not they use tools; a populated one is refused because
+            // this engine cannot call tools.
+            if (route == Route::ChatCompletions) {
+                if (id tools = root[@"tools"]; tools != nil &&
+                                               tools != [NSNull null]) {
+                    if (![tools isKindOfClass:[NSArray class]]) {
+                        return parse_error(
+                            CompletionRequestError::WrongFieldType,
+                            "tools must be an array");
+                    }
+                    if ([static_cast<NSArray*>(tools) count] != 0) {
+                        return parse_error(
+                            CompletionRequestError::UnknownField,
+                            "tool calling is not supported by this engine;"
+                            " send tools omitted or empty");
+                    }
+                }
             }
 
             ParsedCompletionRequest request;

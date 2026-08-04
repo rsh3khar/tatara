@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tatara"
-version = "0.2.0"
+version = "0.2.1"
 description = "Performance-specialized Apple-silicon inference engine"
 requires-python = ">=3.11"
 
